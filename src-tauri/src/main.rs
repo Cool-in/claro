@@ -26,6 +26,11 @@ struct PendingPopup {
     generation: u64,
     payload: Value,
 }
+#[derive(Clone, Copy)]
+struct PopupDrag {
+    window: (i32, i32),
+    cursor: (f64, f64),
+}
 struct Core {
     settings: Mutex<Settings>,
     client: reqwest::Client,
@@ -37,6 +42,7 @@ struct Core {
     popup_picker: AtomicBool,
     popup_saved_position: Mutex<Option<(i32, i32)>>,
     popup_dragging: AtomicBool,
+    popup_drag: Mutex<Option<PopupDrag>>,
     popup_move_epoch: AtomicU64,
     pending_popup: Mutex<Option<PendingPopup>>,
     popup_epoch: AtomicU64,
@@ -115,7 +121,7 @@ fn get_state(app: tauri::AppHandle, core: State<Arc<Core>>) -> Value {
     let r = license::release();
     let settings = core.settings.lock().unwrap().clone();
     let has_key = key_for(&settings).is_ok();
-    json!({"settings":settings,"hasKey":has_key,"licensed":licensed(),"paused":core.paused.load(Ordering::SeqCst),"permission":core.permission.load(Ordering::SeqCst),"checkoutAvailable":!r.checkout_url.is_empty(),"modelAvailable":r.model.is_some(),"launchAtLogin":app.autolaunch().is_enabled().unwrap_or(false),"statusError":core.status_error.lock().unwrap().clone()})
+    json!({"settings":settings,"hasKey":has_key,"licensed":licensed(),"paused":core.paused.load(Ordering::SeqCst),"permission":core.permission.load(Ordering::SeqCst),"checkoutAvailable":!r.checkout_url.is_empty()&&r.model.is_some(),"modelAvailable":r.model.is_some(),"launchAtLogin":app.autolaunch().is_enabled().unwrap_or(false),"statusError":core.status_error.lock().unwrap().clone()})
 }
 #[tauri::command]
 fn save_settings(
@@ -125,6 +131,9 @@ fn save_settings(
     api_key: Option<String>,
 ) -> Result<(), String> {
     provider::endpoint(&settings.base_url)?;
+    if !["system", "light", "dark"].contains(&settings.popup_theme.as_str()) {
+        return Err("Choose a valid popup theme.".into());
+    }
     if settings.model.trim().is_empty() || settings.model.len() > 200 {
         return Err("Enter a provider model name.".into());
     }
@@ -224,11 +233,77 @@ fn start_popup_drag(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(),
     let window = app
         .get_webview_window("popup")
         .ok_or("The translation panel is closed.")?;
+    let position = window
+        .outer_position()
+        .map_err(|_| "Couldn't read the popup position.")?;
+    let cursor = window
+        .cursor_position()
+        .map_err(|_| "Couldn't read the pointer position.")?;
+    *core.popup_drag.lock().unwrap() = Some(PopupDrag {
+        window: (position.x, position.y),
+        cursor: (cursor.x, cursor.y),
+    });
     core.popup_dragging.store(true, Ordering::SeqCst);
-    if window.start_dragging().is_err() {
-        core.popup_dragging.store(false, Ordering::SeqCst);
-        return Err("Couldn't move the translation panel.".into());
+    qa(&app, &core, "drag_started");
+    Ok(())
+}
+fn move_drag(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> {
+    let drag = { *core.popup_drag.lock().unwrap() };
+    let Some(drag) = drag else { return Ok(()) };
+    if let Some(window) = app.get_webview_window("popup") {
+        let cursor = window
+            .cursor_position()
+            .map_err(|_| "Couldn't read the pointer position.")?;
+        let position = (
+            drag.window.0 + (cursor.x - drag.cursor.0).round() as i32,
+            drag.window.1 + (cursor.y - drag.cursor.1).round() as i32,
+        );
+        window
+            .set_position(tauri::PhysicalPosition::new(position.0, position.1))
+            .map_err(|_| "Couldn't move the popup.")?;
+        *core.popup_saved_position.lock().unwrap() = Some(position);
     }
+    Ok(())
+}
+#[tauri::command]
+fn move_popup_drag(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+    move_drag(&app, &core)
+}
+fn finish_drag(app: &tauri::AppHandle, core: &Arc<Core>) {
+    let _ = move_drag(app, core);
+    core.popup_drag.lock().unwrap().take();
+    core.popup_dragging.store(false, Ordering::SeqCst);
+    core.popup_move_epoch.fetch_add(1, Ordering::SeqCst);
+    let position = { *core.popup_saved_position.lock().unwrap() };
+    if let Some(position) = position {
+        save_placement(app, position);
+    }
+    qa(app, core, "drag_finished");
+}
+#[tauri::command]
+fn end_popup_drag(app: tauri::AppHandle, core: State<Arc<Core>>) {
+    finish_drag(&app, &core);
+}
+#[tauri::command]
+fn get_popup_theme(core: State<Arc<Core>>) -> String {
+    core.settings.lock().unwrap().popup_theme.clone()
+}
+#[tauri::command]
+fn set_popup_theme(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    theme: String,
+) -> Result<(), String> {
+    if !["system", "light", "dark"].contains(&theme.as_str()) {
+        return Err("Choose System, Light or Dark.".into());
+    }
+    let mut settings = core.settings.lock().unwrap().clone();
+    settings.popup_theme = theme.clone();
+    persist_settings(&app, &settings)?;
+    *core.settings.lock().unwrap() = settings;
+    let _ = app.emit("popup-theme-changed", theme);
+    let _ = app.emit_to("settings", "state-changed", ());
+    qa(&app, &core, "theme_changed");
     Ok(())
 }
 #[tauri::command]
@@ -378,6 +453,8 @@ fn dismiss(app: &tauri::AppHandle, core: &Arc<Core>, remember: bool) {
     qa(app, core, if remember { "dismiss" } else { "clear" });
     abort_cloud(core);
     core.popup_picker.store(false, Ordering::SeqCst);
+    core.popup_drag.lock().unwrap().take();
+    core.popup_dragging.store(false, Ordering::SeqCst);
     core.tracker.lock().unwrap().dismiss(remember);
     if let Some(w) = app.get_webview_window("popup") {
         let _ = w.hide();
@@ -442,12 +519,16 @@ async fn download_model(app: tauri::AppHandle, core: State<'_, Arc<Core>>) -> Re
 }
 #[tauri::command]
 fn open_purchase() -> Result<(), String> {
-    let u = license::release().checkout_url;
+    let release = license::release();
+    if release.model.is_none() {
+        return Err("The offline download is being prepared. Purchasing will be available when it is ready.".into());
+    }
+    let u = release.checkout_url;
     if u.is_empty() {
         return Err("Checkout is not configured in this development build.".into());
     }
     let url = url::Url::parse(&u).map_err(|_| "Invalid checkout URL.")?;
-    if url.scheme() != "https" || url.host_str() != Some("polar.sh") {
+    if url.scheme() != "https" || !matches!(url.host_str(), Some("polar.sh" | "buy.polar.sh")) {
         return Err("Checkout must use the configured Polar page.".into());
     }
     open_url(&u)
@@ -591,16 +672,9 @@ fn capture(app: tauri::AppHandle, core: Arc<Core>) {
                     let core = core.clone();
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        if let Some(window) = app.get_webview_window("popup") {
-                            if let Ok(position) = window.outer_position() {
-                                let value = (position.x, position.y);
-                                *core.popup_saved_position.lock().unwrap() = Some(value);
-                                core.popup_move_epoch.fetch_add(1, Ordering::SeqCst);
-                                save_placement(&app, value);
-                                qa(&app, &core, "placement_saved");
-                            }
+                        if core.popup_dragging.load(Ordering::SeqCst) {
+                            finish_drag(&app, &core);
                         }
-                        core.popup_dragging.store(false, Ordering::SeqCst);
                     });
                 }
                 continue;
@@ -743,6 +817,8 @@ fn ensure_popup(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> 
     .visible(false)
     .decorations(false)
     .transparent(true)
+    .background_color(tauri::webview::Color(0, 0, 0, 0))
+    .accept_first_mouse(true)
     .always_on_top(true)
     .skip_taskbar(true)
     .resizable(false)
@@ -993,6 +1069,7 @@ fn main() {
         popup_picker: AtomicBool::new(false),
         popup_saved_position: Mutex::new(None),
         popup_dragging: AtomicBool::new(false),
+        popup_drag: Mutex::new(None),
         popup_move_epoch: AtomicU64::new(0),
         pending_popup: Mutex::new(None),
         popup_epoch: AtomicU64::new(0),
@@ -1015,7 +1092,7 @@ fn main() {
             activate_license,
             download_model,
             open_purchase,
-            open_accessibility,copy_translation,resize_popup,popup_ready,set_launch_at_login,popup_rendered,change_popup_target,set_popup_picker,start_popup_drag,follow_selection
+            open_accessibility,copy_translation,resize_popup,popup_ready,set_launch_at_login,popup_rendered,change_popup_target,set_popup_picker,start_popup_drag,move_popup_drag,end_popup_drag,get_popup_theme,set_popup_theme,follow_selection
         ])
         .setup(move |app| {
             let path = config_path(app.handle());

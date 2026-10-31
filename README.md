@@ -6,7 +6,7 @@ Free download with your own OpenAI or OpenAI-compatible API key. A planned $10 l
 
 ## What is implemented
 
-- A compact content-sized popup with one header, bundled target-language flags, copy/dismiss and immediate retranslation when its target changes. The target becomes the saved default. Drag the blank header/Claro mark to retain a position; the menu’s Follow selection option resets it. Only coordinates are saved.
+- A compact content-sized popup with one header, bundled target-language flags, copy/dismiss and immediate retranslation when its target changes. The target becomes the saved default. Drag the visible six-dot grip or blank header to retain a position; the menu’s Follow selection option resets it. Only coordinates are saved. Choose System, Light or Dark appearance from the popup menu; the theme is saved separately from translation content.
 - Rust/Tauri 2 background core, tray menu and shared TypeScript UI. Settings and popup webviews are created when needed. Closing settings destroys its webview. A dismissed popup is destroyed after 10 seconds.
 - Native macOS Accessibility notifications, mouse-up wake and bounded 600 ms fallback checks. Native Windows UI Automation TextPattern, selection/focus events and bounded fallback checks. No clipboard scraping or shell-based text capture.
 - A 60 ms mouse-up settle plus 30 ms dispatch delay, 150 ms keyboard debounce, current-selection deduplication, stale-result guards, cancellation of obsolete automatic cloud requests, pause, app exclusions, secure-field exclusion and lock/session suspension. Unsupported apps have a manual paste path.
@@ -64,9 +64,9 @@ python3 scripts/model-manifest.py /stable/Claro/offline-model/m2m100-int8 \
 
 Check the converter's current `--help` before use; the exact pinned source revision must be selected. `offline/model.manifest.reference.json` contains the verified local file checksums and explicitly nonfunctional placeholder URLs. It is a reference, not an enabled download manifest.
 
-Before enabling purchase/download in a release, populate `src-tauri/release.json` with the real Polar organization ID, license-key benefit ID, public checkout URL and model download manifest. Configure a $10 lifetime product without expiry or usage quotas. A single license must work on Mac and Windows; device activations are not required by this client. Keep all organization tokens and signing secrets outside the repository.
+The public Polar organization ID, license-key benefit ID and checkout URL are populated in `src-tauri/release.json`. The configured product is $10 one-time with no expiry, activation limit or usage quota. Before enabling purchase/download, provide the approved pinned model download manifest and finish live Polar account activation. A single license must work on Mac and Windows; device activations are not required by this client. Keep all organization tokens and signing secrets outside the repository.
 
-The Polar product does not exist yet, so checkout, real entitlement activation and public model download remain deliberately unavailable. No fake purchase or license is created. Automatic cloud translation also requires the user's own provider key.
+The private/unlisted Polar product exists, but its checkout currently reports test mode and payments unavailable. The model download manifest is still null. Both frontend and backend purchase entry points stay gated until the model is configured; real checkout, license activation and model delivery are not yet verified. No fake purchase or license is created. Automatic cloud translation also requires the user's own provider key.
 
 ## Performance and verification
 

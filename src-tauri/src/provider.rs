@@ -13,6 +13,11 @@ pub struct Settings {
     pub excluded_apps: Vec<String>,
     #[serde(default = "warm_by_default")]
     pub keep_model_warm: bool,
+    #[serde(default = "system_theme")]
+    pub popup_theme: String,
+}
+fn system_theme() -> String {
+    "system".into()
 }
 fn warm_by_default() -> bool {
     true
@@ -31,6 +36,7 @@ impl Default for Settings {
             consent: false,
             excluded_apps: vec![],
             keep_model_warm: true,
+            popup_theme: "system".into(),
         }
     }
 }
@@ -169,5 +175,30 @@ mod integration_tests {
             .block_on(translate(&client, &s, "test", &"a".repeat(12001)))
             .unwrap_err()
             .contains("12,000"));
+    }
+}
+
+#[cfg(test)]
+mod popup_theme_tests {
+    use super::*;
+    #[test]
+    fn older_settings_default_to_system_and_explicit_themes_roundtrip() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("popupTheme");
+        assert_eq!(
+            serde_json::from_value::<Settings>(value.clone())
+                .unwrap()
+                .popup_theme,
+            "system"
+        );
+        for theme in ["light", "dark"] {
+            value["popupTheme"] = serde_json::json!(theme);
+            assert_eq!(
+                serde_json::from_value::<Settings>(value.clone())
+                    .unwrap()
+                    .popup_theme,
+                theme
+            );
+        }
     }
 }

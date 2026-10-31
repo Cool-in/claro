@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import './style.css';
 import { mountPopup } from './popup';
 
-type Settings={target:string;sourceLanguage:string;baseUrl:string;model:string;mode:'cloud'|'offline';consent:boolean;excludedApps:string[];keepModelWarm:boolean};
+type Settings={target:string;sourceLanguage:string;baseUrl:string;model:string;mode:'cloud'|'offline';consent:boolean;excludedApps:string[];keepModelWarm:boolean;popupTheme:string};
 type State={settings:Settings;hasKey:boolean;licensed:boolean;paused:boolean;permission:boolean;checkoutAvailable:boolean;modelAvailable:boolean;launchAtLogin:boolean;statusError?:string};
 const root=document.querySelector<HTMLDivElement>('#app')!;
 const isPopup=new URLSearchParams(location.search).has('popup');

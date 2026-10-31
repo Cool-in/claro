@@ -19,9 +19,12 @@ const copy = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" 
 type Translation = { state: string; target?: string; mode?: string; text?: string; error?: string };
 
 export function mountPopup(root: HTMLElement, mark: string, close: string) {
+  document.documentElement.classList.add('popup-root');
+  document.documentElement.dataset.popupTheme='system';
   document.body.classList.add('popup-body');
   root.innerHTML = `<section class="translation-panel" aria-label="Claro translation">
     <header class="popup-header">
+      <button class="drag-grip" id="drag-grip" type="button" aria-label="Move translation popup" title="Drag to move"><svg viewBox="0 0 12 16" aria-hidden="true"><circle cx="4" cy="4" r="1"/><circle cx="8" cy="4" r="1"/><circle cx="4" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="8" cy="12" r="1"/></svg></button>
       <span class="tiny-mark" role="img" aria-label="Claro">${mark}</span>
       <button class="target-picker" id="target-picker" aria-haspopup="menu" aria-expanded="false" aria-controls="language-menu" aria-label="Translate into Spanish"><img alt="" id="target-flag" src="${flag('Spanish')}">${chevron}</button>
       <span class="popup-status" id="popup-status" role="status"></span>
@@ -29,7 +32,7 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
       <button class="icon-button" id="copy" aria-label="Copy translation" disabled>${copy}</button>
       <button class="icon-button" id="dismiss" aria-label="Dismiss translation">${close}</button>
     </header>
-    <div id="language-menu" class="language-menu" role="menu" aria-label="Translation options" hidden><button type="button" id="follow-selection" role="menuitem" title="Reset the saved popup position">↳ Follow selection</button><div class="menu-divider"></div>${Object.keys(languageCountries).map(language => `<button type="button" role="menuitemradio" aria-checked="${language === 'Spanish'}" data-language="${language}" tabindex="-1"><img alt="" src="${flag(language)}"><span>${language}</span><span class="language-check" aria-hidden="true">✓</span></button>`).join('')}</div>
+    <div id="language-menu" class="language-menu" role="menu" aria-label="Translation options" hidden><div class="theme-options" role="group" aria-label="Popup appearance">${['system','light','dark'].map(theme=>`<button type="button" role="menuitemradio" aria-checked="${theme==='system'}" data-theme-choice="${theme}" aria-label="${theme[0].toUpperCase()+theme.slice(1)} popup theme">${theme[0].toUpperCase()+theme.slice(1)}</button>`).join('')}</div><div class="menu-divider"></div><button type="button" id="follow-selection" role="menuitem" title="Reset the saved popup position">↳ Follow selection</button><div class="menu-divider"></div>${Object.keys(languageCountries).map(language => `<button type="button" role="menuitemradio" aria-checked="${language === 'Spanish'}" data-language="${language}" tabindex="-1"><img alt="" src="${flag(language)}"><span>${language}</span><span class="language-check" aria-hidden="true">✓</span></button>`).join('')}</div>
     <div class="translation-text" id="translation" aria-live="polite"></div>
   </section>`;
   const panel = root.querySelector<HTMLElement>('.translation-panel')!;
@@ -85,12 +88,39 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
     else text.textContent = payload.text || payload.error || '';
     requestAnimationFrame(size);
   }
-  root.querySelector('.popup-header')!.addEventListener('mousedown', event => {
-    const mouse=event as MouseEvent;
-    if(mouse.button!==0||(event.target as HTMLElement).closest('button'))return;
-    mouse.preventDefault();invoke('start_popup_drag').catch(()=>{});
+  let activePointer:number|null=null;
+  let dragStart:Promise<unknown>=Promise.resolve();
+  let moveQueued=false;
+  const grip=root.querySelector<HTMLElement>('#drag-grip')!;
+  root.querySelector('.popup-header')!.addEventListener('pointerdown',event=>{
+    const pointer=event as PointerEvent;
+    const button=(event.target as Element).closest('button');
+    if(pointer.button!==0||(button&&button.id!=='drag-grip'))return;
+    pointer.preventDefault();activePointer=pointer.pointerId;
+    grip.setPointerCapture(pointer.pointerId);document.body.classList.add('popup-dragging');
+    dragStart=invoke('start_popup_drag').catch(()=>{activePointer=null;document.body.classList.remove('popup-dragging');});
   });
-  root.querySelector('.popup-header')!.setAttribute('title','Drag to move');
+  grip.addEventListener('pointermove',()=>{
+    if(activePointer===null||moveQueued)return;moveQueued=true;
+    requestAnimationFrame(async()=>{moveQueued=false;await dragStart;if(activePointer!==null)invoke('move_popup_drag').catch(()=>{});});
+  });
+  async function endDrag(){
+    if(activePointer===null)return;const pointer=activePointer;activePointer=null;
+    document.body.classList.remove('popup-dragging');
+    if(grip.hasPointerCapture(pointer))grip.releasePointerCapture(pointer);
+    await dragStart;await invoke('end_popup_drag').catch(()=>{});
+  }
+  grip.addEventListener('pointerup',endDrag);grip.addEventListener('pointercancel',endDrag);grip.addEventListener('lostpointercapture',endDrag);
+  root.querySelector('.popup-header')!.setAttribute('title','Drag the grip to move');
+  function applyTheme(theme:string){
+    const value=['system','light','dark'].includes(theme)?theme:'system';document.documentElement.dataset.popupTheme=value;
+    menu.querySelectorAll<HTMLElement>('[data-theme-choice]').forEach(button=>button.setAttribute('aria-checked',String(button.dataset.themeChoice===value)));
+  }
+  menu.querySelectorAll<HTMLButtonElement>('[data-theme-choice]').forEach(button=>button.addEventListener('click',async()=>{
+    try{await invoke('set_popup_theme',{theme:button.dataset.themeChoice});applyTheme(button.dataset.themeChoice!);await setMenu(false);}
+    catch(error){render({state:'error',target,error:String(error)});}
+  }));
+  listen<string>('popup-theme-changed',({payload})=>applyTheme(payload));
   root.querySelector('#follow-selection')!.addEventListener('click',async()=>{
     await setMenu(false);try{await invoke('follow_selection');}catch(error){render({state:'error',target,error:String(error)});}
   });
@@ -124,5 +154,5 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') { event.preventDefault(); if (menuOpen) setMenu(false); else invoke('dismiss_popup'); }
   });
-  listen<Translation>('translation', ({ payload }) => render(payload)).then(() => invoke('popup_ready'));
+  listen<Translation>('translation', ({ payload }) => render(payload)).then(async()=>{applyTheme(await invoke<string>('get_popup_theme'));await invoke('popup_ready');});
 }

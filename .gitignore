@@ -10,3 +10,4 @@ src-tauri/gen/
 *.obj
 *.pdb
 *.exp
+/polar-product-proof.jpg
