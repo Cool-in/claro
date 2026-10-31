@@ -1,0 +1,14 @@
+{
+  "source": "facebook/m2m100_418M",
+  "sourceRevision": "55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636",
+  "sourceUrl": "https://huggingface.co/facebook/m2m100_418M",
+  "license": "MIT",
+  "converter": "ctranslate2 4.8.4",
+  "transformers": "5.22.1",
+  "torch": "2.15.0",
+  "quantization": "int8",
+  "nativeTokenizer": "SentencePiece 0.2.1",
+  "sourceTokens": "__SOURCE_ISO639_1__ + SentencePiece pieces + </s>",
+  "targetPrefix": "__TARGET_ISO639_1__",
+  "downloadRelease": "Not published. release.json intentionally has no model URLs."
+}

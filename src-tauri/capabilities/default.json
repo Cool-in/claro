@@ -1,0 +1,1 @@
+{"identifier":"default","description":"Local Claro windows only","windows":["settings","popup"],"permissions":["core:default","core:event:allow-listen","core:event:allow-unlisten"]}

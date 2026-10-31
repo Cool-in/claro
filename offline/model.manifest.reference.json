@@ -1,0 +1,30 @@
+{
+  "id": "m2m100-418m-int8-v1",
+  "bytes": 495887877,
+  "files": [
+    {
+      "name": "config.json",
+      "url": "https://example.invalid/not-published/config.json",
+      "sha256": "8f6496adfc930cbfecbe8281112197705c488fab47d34b4829b06d7f478909af",
+      "bytes": 223
+    },
+    {
+      "name": "model.bin",
+      "url": "https://example.invalid/not-published/model.bin",
+      "sha256": "6339fb0422af0223d1a1c562fe84fe8cf09bd3280a0cb7b8e29488d9b0c61870",
+      "bytes": 490667752
+    },
+    {
+      "name": "shared_vocabulary.json",
+      "url": "https://example.invalid/not-published/shared_vocabulary.json",
+      "sha256": "7eb5d0ff184c6095c7c10f9911c0aea492250abd12854f9c3d787c64b1c6397e",
+      "bytes": 2796509
+    },
+    {
+      "name": "sentencepiece.bpe.model",
+      "url": "https://example.invalid/not-published/sentencepiece.bpe.model",
+      "sha256": "d8f7c76ed2a5e0822be39f0a4f95a55eb19c78f4593ce609e2edbc2aea4d380a",
+      "bytes": 2423393
+    }
+  ]
+}

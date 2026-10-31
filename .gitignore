@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+.DS_Store
+.env
+*.log
+build-cache/
+__pycache__/
+src-tauri/gen/
+*.obj
+*.pdb
+*.exp
