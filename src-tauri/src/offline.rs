@@ -492,6 +492,9 @@ async fn run(
     if source == target {
         return Ok(text.into());
     }
+    if let Some((core, _)) = &guard {
+        crate::qa(app, core, "offline_queue_entered");
+    }
     let mut slot = WORKER.lock().await;
     // Older requests queued behind inference are discarded before doing more work.
     if !current(&guard) {
@@ -506,6 +509,12 @@ async fn run(
     }
     if slot.is_none() {
         *slot = Some(start_worker(app, path).await?);
+    }
+    if !current(&guard) {
+        return Err("Selection changed.".into());
+    }
+    if let Some((core, _)) = &guard {
+        crate::qa(app, core, "offline_inference_started");
     }
     let worker = slot.as_mut().unwrap();
     worker.request += 1;
@@ -550,6 +559,11 @@ async fn run(
             return Err("Offline translation took too long. Try a shorter selection.".into());
         }
     };
+    if current(&guard) {
+        if let Some((core, _)) = &guard {
+            crate::qa(app, core, "offline_inference_completed");
+        }
+    }
     // Always drain the matching reply, even if this selection was superseded.
     slot.as_mut().unwrap().last_used = std::time::Instant::now();
     drop(slot);

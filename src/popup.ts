@@ -16,7 +16,7 @@ const flags = import.meta.glob<string>(
 const flag = (language: string) => flags[`/node_modules/flag-icons/flags/4x3/${languageCountries[language] || 'es'}.svg`];
 const chevron = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="m3 4.5 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
 const copy = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="7" height="8" rx="1.5"/><path d="M10 3.5v-1A1.5 1.5 0 0 0 8.5 1h-6A1.5 1.5 0 0 0 1 2.5v7A1.5 1.5 0 0 0 2.5 11h1"/></svg>';
-type Translation = { state: string; target?: string; mode?: string; text?: string; error?: string };
+type Translation = { generation?: number; state: string; target?: string; mode?: string; text?: string; error?: string };
 
 export function mountPopup(root: HTMLElement, mark: string, close: string) {
   document.documentElement.classList.add('popup-root');
@@ -24,7 +24,6 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
   document.body.classList.add('popup-body');
   root.innerHTML = `<section class="translation-panel" aria-label="Claro translation">
     <header class="popup-header">
-      <button class="drag-grip" id="drag-grip" type="button" aria-label="Move translation popup" title="Drag to move"><svg viewBox="0 0 12 16" aria-hidden="true"><circle cx="4" cy="4" r="1"/><circle cx="8" cy="4" r="1"/><circle cx="4" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="8" cy="12" r="1"/></svg></button>
       <span class="tiny-mark" role="img" aria-label="Claro">${mark}</span>
       <button class="target-picker" id="target-picker" aria-haspopup="menu" aria-expanded="false" aria-controls="language-menu" aria-label="Translate into Spanish"><img alt="" id="target-flag" src="${flag('Spanish')}">${chevron}</button>
       <span class="popup-status" id="popup-status" role="status"></span>
@@ -58,7 +57,6 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
     panel.style.height = 'auto';
     const height = Math.ceil(panel.getBoundingClientRect().height);
     invoke('resize_popup', { width: width + 12, height: height + 12 }).catch(() => {});
-    invoke('popup_rendered', { state: current.state }).catch(() => {});
   }
   function setTarget(language: string) {
     target = language;
@@ -86,32 +84,42 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
     text.className = `translation-text ${payload.state}`;
     if (payload.state === 'loading') text.innerHTML = '<span class="shimmer"></span>';
     else text.textContent = payload.text || payload.error || '';
-    requestAnimationFrame(size);
+    requestAnimationFrame(() => {
+      size();
+      invoke('popup_rendered', { state: payload.state, generation: payload.generation }).catch(() => {});
+    });
   }
   let activePointer:number|null=null;
   let dragStart:Promise<unknown>=Promise.resolve();
   let moveQueued=false;
-  const grip=root.querySelector<HTMLElement>('#drag-grip')!;
-  root.querySelector('.popup-header')!.addEventListener('pointerdown',event=>{
+  let pointerPosition={x:0,y:0};
+  document.body.addEventListener('pointerdown',event=>{
     const pointer=event as PointerEvent;
-    const button=(event.target as Element).closest('button');
-    if(pointer.button!==0||(button&&button.id!=='drag-grip'))return;
+    const interactive=(event.target as Element).closest('button, .translation-text, .language-menu');
+    if(pointer.button!==0||interactive)return;
     pointer.preventDefault();activePointer=pointer.pointerId;
-    grip.setPointerCapture(pointer.pointerId);document.body.classList.add('popup-dragging');
-    dragStart=invoke('start_popup_drag').catch(()=>{activePointer=null;document.body.classList.remove('popup-dragging');});
+    pointerPosition={x:pointer.screenX,y:pointer.screenY};
+    document.body.setPointerCapture(pointer.pointerId);document.body.classList.add('popup-dragging');
+    dragStart=invoke('start_popup_drag',pointerPosition).catch(()=>{activePointer=null;document.body.classList.remove('popup-dragging');});
   });
-  grip.addEventListener('pointermove',()=>{
-    if(activePointer===null||moveQueued)return;moveQueued=true;
-    requestAnimationFrame(async()=>{moveQueued=false;await dragStart;if(activePointer!==null)invoke('move_popup_drag').catch(()=>{});});
+  document.body.addEventListener('pointermove',event=>{
+    if(activePointer===null)return;
+    pointerPosition={x:event.screenX,y:event.screenY};
+    if(moveQueued)return;moveQueued=true;
+    requestAnimationFrame(async()=>{moveQueued=false;await dragStart;if(activePointer!==null)invoke('move_popup_drag',pointerPosition).catch(()=>{});});
   });
-  async function endDrag(){
-    if(activePointer===null)return;const pointer=activePointer;activePointer=null;
+  async function endDrag(event:Event){
+    if(activePointer===null)return;
+    if(event.type==='pointerup'){const pointer=event as PointerEvent;pointerPosition={x:pointer.screenX,y:pointer.screenY};}
+    const pointer=activePointer;activePointer=null;
     document.body.classList.remove('popup-dragging');
-    if(grip.hasPointerCapture(pointer))grip.releasePointerCapture(pointer);
-    await dragStart;await invoke('end_popup_drag').catch(()=>{});
+    if(document.body.hasPointerCapture(pointer))document.body.releasePointerCapture(pointer);
+    await dragStart;
+    await invoke('move_popup_drag',pointerPosition).catch(()=>{});
+    await invoke('end_popup_drag').catch(()=>{});
   }
-  grip.addEventListener('pointerup',endDrag);grip.addEventListener('pointercancel',endDrag);grip.addEventListener('lostpointercapture',endDrag);
-  root.querySelector('.popup-header')!.setAttribute('title','Drag the grip to move');
+  document.body.addEventListener('pointerup',endDrag);document.body.addEventListener('pointercancel',endDrag);document.body.addEventListener('lostpointercapture',endDrag);
+  root.querySelector('.popup-header')!.setAttribute('title','Drag the background to move');
   function applyTheme(theme:string){
     const value=['system','light','dark'].includes(theme)?theme:'system';document.documentElement.dataset.popupTheme=value;
     menu.querySelectorAll<HTMLElement>('[data-theme-choice]').forEach(button=>button.setAttribute('aria-checked',String(button.dataset.themeChoice===value)));

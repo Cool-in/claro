@@ -25,7 +25,8 @@ func poll(settled: Bool = false) {
     let trusted = AXIsProcessTrusted()
     if lastTrust != trusted { lastTrust = trusted; output(["kind":"status","trusted":trusted]) }
     guard trusted else { return }
-    guard enabled && !suspended && !dragging else { output(["kind":"clear"]); return }
+    guard enabled && !suspended else { output(["kind":"clear"]); return }
+    guard !dragging else { return }
     guard let front = NSWorkspace.shared.frontmostApplication else { output(["kind":"clear"]); return }
     let identifier = front.bundleIdentifier ?? front.localizedName ?? "unknown"
     if front.processIdentifier == getpid() || identifier == "app.claro.translate" { output(["kind":"clear","reason":"self"]); return }
@@ -69,13 +70,10 @@ let _ = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDo
     if event.type == .keyDown && event.keyCode != 53 { return }
     if event.type != .keyDown {
       let mouse = NSEvent.mouseLocation
-      let point = CGPoint(x:mouse.x,y:(NSScreen.screens.first?.frame.height ?? 0)-mouse.y)
-      let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []
-      for window in windows {
-        guard let bounds=window[kCGWindowBounds as String] as? [String:Any], let rect=CGRect(dictionaryRepresentation:bounds as CFDictionary),rect.contains(point) else { continue }
-        if let pid=window[kCGWindowOwnerPID as String] as? Int, pid == Int(CommandLine.arguments.dropFirst().first ?? "0") { return }
-        break
-      }
+      let point = event.cgEvent?.location ?? CGPoint(x:mouse.x,y:(NSScreen.screens.first?.frame.height ?? 0)-mouse.y)
+      output(["kind":"pointer-down","x":point.x,"y":point.y])
+      if event.type == .leftMouseDown { dragging = true }
+      return
     }
     if event.type == .leftMouseDown { dragging = true }
     output(["kind":"dismiss"])

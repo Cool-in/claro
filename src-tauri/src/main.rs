@@ -30,6 +30,7 @@ struct PendingPopup {
 struct PopupDrag {
     window: (i32, i32),
     cursor: (f64, f64),
+    scale: f64,
 }
 struct Core {
     settings: Mutex<Settings>,
@@ -68,6 +69,33 @@ fn qa(app: &tauri::AppHandle, core: &Arc<Core>, event: &str) {
     state["last_event"] = json!(event);
     state["last_event_ms"] = json!(now);
     state[format!("{}_at_ms", event)] = json!(now);
+    if event == "selection_accepted" || event == "target_changed" {
+        state["request_started_ms"] = json!(now);
+        state["selection_to_ready_ms"] = Value::Null;
+        state["translation_duration_ms"] = Value::Null;
+        state["offline_queue_wait_ms"] = Value::Null;
+        state["offline_inference_ms"] = Value::Null;
+    }
+    if event == "translation_completed" {
+        if let Some(start) = state["translation_started_at_ms"].as_u64() {
+            state["translation_duration_ms"] = json!(now.saturating_sub(start));
+        }
+    }
+    if event == "offline_inference_started" {
+        if let Some(start) = state["offline_queue_entered_at_ms"].as_u64() {
+            state["offline_queue_wait_ms"] = json!(now.saturating_sub(start));
+        }
+    }
+    if event == "offline_inference_completed" {
+        if let Some(start) = state["offline_inference_started_at_ms"].as_u64() {
+            state["offline_inference_ms"] = json!(now.saturating_sub(start));
+        }
+    }
+    if event == "rendered_ready" && state["selection_to_ready_ms"].is_null() {
+        if let Some(start) = state["request_started_ms"].as_u64() {
+            state["selection_to_ready_ms"] = json!(now.saturating_sub(start));
+        }
+    }
     state["permission"] = json!(core.permission.load(Ordering::SeqCst));
     state["paused"] = json!(core.paused.load(Ordering::SeqCst));
     state["popup_renderer_ready"] = json!(core.popup_ready.load(Ordering::SeqCst));
@@ -176,6 +204,9 @@ fn save_settings(
     control(&core);
     core.tracker.lock().unwrap().clear();
     dismiss(&app, &core, false);
+    if core.settings.lock().unwrap().consent {
+        let _ = ensure_popup(&app, &core);
+    }
     Ok(())
 }
 fn persist_settings(app: &tauri::AppHandle, settings: &Settings) -> Result<(), String> {
@@ -229,34 +260,34 @@ fn save_placement(app: &tauri::AppHandle, position: (i32, i32)) {
     }
 }
 #[tauri::command]
-fn start_popup_drag(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+fn start_popup_drag(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
     let window = app
         .get_webview_window("popup")
         .ok_or("The translation panel is closed.")?;
     let position = window
         .outer_position()
         .map_err(|_| "Couldn't read the popup position.")?;
-    let cursor = window
-        .cursor_position()
-        .map_err(|_| "Couldn't read the pointer position.")?;
     *core.popup_drag.lock().unwrap() = Some(PopupDrag {
         window: (position.x, position.y),
-        cursor: (cursor.x, cursor.y),
+        cursor: (x, y),
+        scale: window.scale_factor().unwrap_or(1.0),
     });
     core.popup_dragging.store(true, Ordering::SeqCst);
     qa(&app, &core, "drag_started");
     Ok(())
 }
-fn move_drag(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> {
+fn move_drag(app: &tauri::AppHandle, core: &Arc<Core>, x: f64, y: f64) -> Result<(), String> {
     let drag = { *core.popup_drag.lock().unwrap() };
     let Some(drag) = drag else { return Ok(()) };
     if let Some(window) = app.get_webview_window("popup") {
-        let cursor = window
-            .cursor_position()
-            .map_err(|_| "Couldn't read the pointer position.")?;
         let position = (
-            drag.window.0 + (cursor.x - drag.cursor.0).round() as i32,
-            drag.window.1 + (cursor.y - drag.cursor.1).round() as i32,
+            drag.window.0 + ((x - drag.cursor.0) * drag.scale).round() as i32,
+            drag.window.1 + ((y - drag.cursor.1) * drag.scale).round() as i32,
         );
         window
             .set_position(tauri::PhysicalPosition::new(position.0, position.1))
@@ -266,11 +297,15 @@ fn move_drag(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> {
     Ok(())
 }
 #[tauri::command]
-fn move_popup_drag(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
-    move_drag(&app, &core)
+fn move_popup_drag(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    move_drag(&app, &core, x, y)
 }
 fn finish_drag(app: &tauri::AppHandle, core: &Arc<Core>) {
-    let _ = move_drag(app, core);
     core.popup_drag.lock().unwrap().take();
     core.popup_dragging.store(false, Ordering::SeqCst);
     core.popup_move_epoch.fetch_add(1, Ordering::SeqCst);
@@ -334,6 +369,22 @@ fn follow_selection(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(),
     qa(&app, &core, "placement_reset");
     Ok(())
 }
+fn clamp_popup_position(
+    position: (i32, i32),
+    size: (i32, i32),
+    area: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let left = area.0 + 8;
+    let top = area.1 + 8;
+    (
+        position
+            .0
+            .clamp(left, (area.0 + area.2 - size.0 - 8).max(left)),
+        position
+            .1
+            .clamp(top, (area.1 + area.3 - size.1 - 8).max(top)),
+    )
+}
 fn place_popup(
     core: &Arc<Core>,
     window: &tauri::WebviewWindow,
@@ -348,9 +399,13 @@ fn place_popup(
     }
     let saved = { *core.popup_saved_position.lock().unwrap() };
     if let Some((x, y)) = saved {
-        let size = window
-            .outer_size()
-            .unwrap_or(tauri::PhysicalSize::new(width as u32, height as u32));
+        // set_size is dispatched asynchronously. Clamp using the requested new
+        // content size, not the old short card returned by outer_size.
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let size = (
+            (width * scale).ceil() as i32,
+            (height * scale).ceil() as i32,
+        );
         let mut result = (x, y);
         if let Ok(monitors) = window.available_monitors() {
             if let Some(monitor) = monitors
@@ -362,15 +417,16 @@ fn place_popup(
                 })
                 .or_else(|| monitors.first())
             {
-                let p = monitor.position();
-                let z = monitor.size();
-                result.0 = x.clamp(
-                    p.x + 8,
-                    (p.x + z.width as i32 - size.width as i32 - 8).max(p.x + 8),
-                );
-                result.1 = y.clamp(
-                    p.y + 8,
-                    (p.y + z.height as i32 - size.height as i32 - 8).max(p.y + 8),
+                let area = monitor.work_area();
+                result = clamp_popup_position(
+                    (x, y),
+                    size,
+                    (
+                        area.position.x,
+                        area.position.y,
+                        area.size.width as i32,
+                        area.size.height as i32,
+                    ),
                 );
             }
         }
@@ -468,6 +524,7 @@ fn dismiss(app: &tauri::AppHandle, core: &Arc<Core>, remember: bool) {
         tokio::time::sleep(Duration::from_secs(10)).await;
         if core.popup_epoch.load(Ordering::SeqCst) == epoch
             && core.pending_popup.lock().unwrap().is_none()
+            && (!core.settings.lock().unwrap().consent || core.paused.load(Ordering::SeqCst))
         {
             core.popup_ready.store(false, Ordering::SeqCst);
             if let Some(w) = app.get_webview_window("popup") {
@@ -612,6 +669,9 @@ struct Capture {
     #[serde(default)]
     top: f64,
 }
+fn point_in_window(x: f64, y: f64, left: f64, top: f64, width: f64, height: f64) -> bool {
+    x >= left && x < left + width && y >= top && y < top + height
+}
 fn capture(app: tauri::AppHandle, core: Arc<Core>) {
     std::thread::spawn(move || {
         let path = app.path().app_cache_dir().unwrap().join(if cfg!(windows) {
@@ -666,12 +726,65 @@ fn capture(app: tauri::AppHandle, core: Arc<Core>) {
                 let _ = app.emit("state-changed", ());
                 continue;
             }
+            if event.kind == "pointer-down" {
+                let mut bounds = None;
+                let inside = app
+                    .get_webview_window("popup")
+                    .map(|window| {
+                        if !window.is_visible().unwrap_or(false) {
+                            return false;
+                        }
+                        let Ok(position) = window.outer_position() else {
+                            return false;
+                        };
+                        let Ok(size) = window.outer_size() else {
+                            return false;
+                        };
+                        #[cfg(target_os = "macos")]
+                        let scale = window.scale_factor().unwrap_or(1.0);
+                        #[cfg(not(target_os = "macos"))]
+                        let scale = 1.0;
+                        bounds = Some((
+                            position.x as f64 / scale,
+                            position.y as f64 / scale,
+                            size.width as f64 / scale,
+                            size.height as f64 / scale,
+                            scale,
+                        ));
+                        point_in_window(
+                            event.x,
+                            event.y,
+                            position.x as f64 / scale,
+                            position.y as f64 / scale,
+                            size.width as f64 / scale,
+                            size.height as f64 / scale,
+                        )
+                    })
+                    .unwrap_or(false);
+                #[cfg(debug_assertions)]
+                {
+                    core.diagnostics.lock().unwrap()["last_pointer"] = json!({"point":[event.x,event.y],"popup_bounds_and_scale":bounds,"inside":inside});
+                }
+                qa(
+                    &app,
+                    &core,
+                    if inside {
+                        "pointer_inside"
+                    } else {
+                        "pointer_outside"
+                    },
+                );
+                if !inside {
+                    dismiss(&app, &core, true);
+                }
+                continue;
+            }
             if event.kind == "pointer-up" {
                 if core.popup_dragging.load(Ordering::SeqCst) {
                     let app = app.clone();
                     let core = core.clone();
                     tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                         if core.popup_dragging.load(Ordering::SeqCst) {
                             finish_drag(&app, &core);
                         }
@@ -836,8 +949,11 @@ fn ensure_popup(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> 
                 use objc::{msg_send, sel, sel_impl};
                 if let Ok(pointer) = window.ns_window() {
                     let ns = pointer as *mut objc::runtime::Object;
-                    let mask: u64 = msg_send![ns, styleMask];
-                    let _: () = msg_send![ns,setStyleMask:mask|128u64];
+                    // This is TaoWindow (NSWindow), not NSPanel. Its canBecomeKeyWindow
+                    // override already prevents activation. A panel-only style bit here
+                    // can interfere with ordinary mouse delivery.
+                    let _: () = msg_send![ns,setMovableByWindowBackground:false];
+                    let _: () = msg_send![ns,setIgnoresMouseEvents:false];
                     let _: () = msg_send![ns,setHidesOnDeactivate:false];
                 }
             });
@@ -881,7 +997,13 @@ fn deliver_popup(app: &tauri::AppHandle, core: &Arc<Core>, generation: u64) {
         }
     });
 }
-fn emit_current(app: &tauri::AppHandle, core: &Arc<Core>, generation: u64, payload: Value) -> bool {
+fn emit_current(
+    app: &tauri::AppHandle,
+    core: &Arc<Core>,
+    generation: u64,
+    mut payload: Value,
+) -> bool {
+    payload["generation"] = json!(generation);
     {
         let tracker = core.tracker.lock().unwrap();
         if !valid_popup(&tracker, core.paused.load(Ordering::SeqCst), generation) {
@@ -952,8 +1074,8 @@ fn position_popup(
     if let Ok(monitors) = w.available_monitors() {
         for m in monitors {
             let scale = m.scale_factor();
-            let p = m.position();
-            let size = m.size();
+            let p = m.work_area().position;
+            let size = m.work_area().size;
             #[cfg(windows)]
             {
                 let left = p.x as f64;
@@ -979,7 +1101,7 @@ fn position_popup(
             let right = left + size.width as f64 / scale;
             let bottom = top + size.height as f64 / scale;
             if x >= left && x <= right && y >= top && y <= bottom {
-                px = x.clamp(left + 12.0, right - width - 12.0);
+                px = x.clamp(left + 12.0, (right - width - 12.0).max(left + 12.0));
                 py = if py + height > bottom {
                     (selection_top - height - 10.0).max(top + 12.0)
                 } else {
@@ -1035,7 +1157,18 @@ fn copy_translation(text: String) -> Result<(), String> {
         .map_err(|_| "Couldn't copy the translation.".into())
 }
 #[tauri::command]
-fn popup_rendered(app: tauri::AppHandle, core: State<Arc<Core>>, state: String) {
+fn popup_rendered(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    state: String,
+    generation: Option<u64>,
+) {
+    if !generation
+        .map(|value| core.tracker.lock().unwrap().is_current(value))
+        .unwrap_or(false)
+    {
+        return;
+    }
     if ["loading", "ready", "error"].contains(&state.as_str()) {
         qa(&app, &core, &format!("rendered_{}", state));
     }
@@ -1161,6 +1294,7 @@ fn main() {
             let refresh_core=core.clone();let refresh_app=handle.clone();tauri::async_runtime::spawn(async move { license::refresh(&refresh_core.client).await; offline::configure(refresh_app.clone(),refresh_core.settings.lock().unwrap().clone()); let _=refresh_app.emit("state-changed",()); });
             offline::configure(handle.clone(),core.settings.lock().unwrap().clone());
             capture(handle.clone(), core.clone());
+            if core.settings.lock().unwrap().consent { let _ = ensure_popup(&handle, &core); }
             if !std::env::args().any(|a|a=="--background"){settings(&handle,false);}
             #[cfg(debug_assertions)]if std::env::args().any(|a|a=="--preview-popup"){
               let preview_app=handle.clone();let preview_core=core.clone();
@@ -1250,5 +1384,34 @@ mod popup_race_tests {
         let next = tracker.select("fixture", "different text").unwrap();
         assert!(!valid_popup(&tracker, false, generation));
         assert!(valid_popup(&tracker, false, next));
+    }
+}
+
+#[cfg(test)]
+mod pointer_bounds_tests {
+    use super::{clamp_popup_position, point_in_window};
+    #[test]
+    fn expanded_menu_fits_work_area_without_replacing_saved_anchor() {
+        let saved = (1168, 1367);
+        let area = (0, 30, 1920, 1410);
+        let short = clamp_popup_position(saved, (188, 85), area);
+        let expanded = clamp_popup_position(saved, (240, 380), area);
+        assert_eq!(short, (1168, 1347));
+        assert_eq!(expanded, (1168, 1052));
+        assert_eq!(clamp_popup_position(saved, (188, 85), area), short);
+        assert_eq!(saved, (1168, 1367));
+        assert_eq!(
+            clamp_popup_position((-300, 0), (240, 380), (-500, 20, 400, 700)),
+            (-348, 28)
+        );
+    }
+    #[test]
+    fn popup_buttons_and_border_are_inside_actual_window_bounds() {
+        assert!(point_in_window(100., 200., 100., 200., 188., 85.));
+        assert!(point_in_window(280., 220., 100., 200., 188., 85.));
+        assert!(!point_in_window(99., 220., 100., 200., 188., 85.));
+        assert!(!point_in_window(288., 220., 100., 200., 188., 85.));
+        assert!(!point_in_window(120., 285., 100., 200., 188., 85.));
+        assert!(point_in_window(-300., 30., -400., 20., 188., 85.));
     }
 }
