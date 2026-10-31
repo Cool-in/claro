@@ -44,6 +44,7 @@ struct Core {
     popup_saved_position: Mutex<Option<(i32, i32)>>,
     popup_dragging: AtomicBool,
     popup_drag: Mutex<Option<PopupDrag>>,
+    settings_drag: Mutex<Option<PopupDrag>>,
     popup_move_epoch: AtomicU64,
     pending_popup: Mutex<Option<PendingPopup>>,
     popup_epoch: AtomicU64,
@@ -318,6 +319,54 @@ fn finish_drag(app: &tauri::AppHandle, core: &Arc<Core>) {
 #[tauri::command]
 fn end_popup_drag(app: tauri::AppHandle, core: State<Arc<Core>>) {
     finish_drag(&app, &core);
+}
+// Settings uses its own drag session; moving it cannot touch popup placement.
+#[tauri::command]
+fn start_settings_drag(
+    window: tauri::WebviewWindow,
+    core: State<Arc<Core>>,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    if window.label() != "settings" {
+        return Err("Open Claro settings to move this window.".into());
+    }
+    let position = window
+        .outer_position()
+        .map_err(|_| "Couldn't read the Settings position.")?;
+    *core.settings_drag.lock().unwrap() = Some(PopupDrag {
+        window: (position.x, position.y),
+        cursor: (x, y),
+        scale: window.scale_factor().unwrap_or(1.0),
+    });
+    Ok(())
+}
+#[tauri::command]
+fn move_settings_drag(
+    window: tauri::WebviewWindow,
+    core: State<Arc<Core>>,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    if window.label() != "settings" {
+        return Err("Open Claro settings to move this window.".into());
+    }
+    let drag = { *core.settings_drag.lock().unwrap() };
+    if let Some(drag) = drag {
+        window
+            .set_position(tauri::PhysicalPosition::new(
+                drag.window.0 + ((x - drag.cursor.0) * drag.scale).round() as i32,
+                drag.window.1 + ((y - drag.cursor.1) * drag.scale).round() as i32,
+            ))
+            .map_err(|_| "Couldn't move Settings.")?;
+    }
+    Ok(())
+}
+#[tauri::command]
+fn end_settings_drag(window: tauri::WebviewWindow, core: State<Arc<Core>>) {
+    if window.label() == "settings" {
+        core.settings_drag.lock().unwrap().take();
+    }
 }
 #[tauri::command]
 fn get_popup_theme(core: State<Arc<Core>>) -> String {
@@ -1203,6 +1252,7 @@ fn main() {
         popup_saved_position: Mutex::new(None),
         popup_dragging: AtomicBool::new(false),
         popup_drag: Mutex::new(None),
+        settings_drag: Mutex::new(None),
         popup_move_epoch: AtomicU64::new(0),
         pending_popup: Mutex::new(None),
         popup_epoch: AtomicU64::new(0),
@@ -1225,7 +1275,7 @@ fn main() {
             activate_license,
             download_model,
             open_purchase,
-            open_accessibility,copy_translation,resize_popup,popup_ready,set_launch_at_login,popup_rendered,change_popup_target,set_popup_picker,start_popup_drag,move_popup_drag,end_popup_drag,get_popup_theme,set_popup_theme,follow_selection
+            start_settings_drag,move_settings_drag,end_settings_drag,open_accessibility,copy_translation,resize_popup,popup_ready,set_launch_at_login,popup_rendered,change_popup_target,set_popup_picker,start_popup_drag,move_popup_drag,end_popup_drag,get_popup_theme,set_popup_theme,follow_selection
         ])
         .setup(move |app| {
             let path = config_path(app.handle());
@@ -1308,8 +1358,17 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window,event|{
-          if window.label()!="popup"{return;}
           let core=window.state::<Arc<Core>>();
+          if window.label()=="settings" {
+            #[cfg(debug_assertions)]
+            if let tauri::WindowEvent::Moved(position)=event {
+              core.diagnostics.lock().unwrap()["settings_position"] = json!([position.x,position.y]);
+              qa(window.app_handle(),&core,"settings_moved");
+            }
+            if matches!(event,tauri::WindowEvent::Destroyed) { core.settings_drag.lock().unwrap().take(); }
+            return;
+          }
+          if window.label()!="popup"{return;}
           if let tauri::WindowEvent::Moved(position)=event{
             if !core.popup_dragging.load(Ordering::SeqCst){return;}
             let value=(position.x,position.y);*core.popup_saved_position.lock().unwrap()=Some(value);

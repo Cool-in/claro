@@ -41,3 +41,5 @@ html.popup-root[data-popup-theme=dark] .translation-panel{--popup-bg:linear-grad
 .popup-root .shimmer{background:linear-gradient(90deg,var(--popup-hover),var(--popup-border),var(--popup-hover));background-size:200%}
 
 .popup-root .translation-panel,.popup-body{cursor:grab;touch-action:none}.popup-root .translation-text{cursor:text;touch-action:auto}.popup-root button{cursor:pointer}.popup-root .language-menu{cursor:default;touch-action:auto}
+
+.settings-dragging,.settings-dragging *{cursor:grabbing!important;user-select:none!important}

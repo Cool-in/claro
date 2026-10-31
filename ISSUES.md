@@ -2,6 +2,7 @@
 
 | ID | State | Finding or acceptance gate |
 | --- | --- | --- |
+| SETTINGS-DRAG | Coordinate QA passed | Main content and sidebar backgrounds move the Settings window without a handle. A +30/+20 drag produced the exact recorded delta; Provider navigation and Model-field focus passed. Separate Settings drag state leaves popup placement unchanged. |
 | QA-MAC-AUTO | Passed by user | User screenshot confirms selected English text produced the Spanish translation popup. Earlier automation observations and the delayed old crash dialog are superseded by this real interaction. |
 | POPUP-REFINEMENT | Passed targeted QA | Short card measured 188 × approximately 85 pixels, one header and no footer. Accessible target menu, actual French/Spanish retargeting, persisted Spanish default, Follow selection reset and dismiss passed. |
 | POPUP-DRAG-FOCUS | Coordinate mouse replay passed, keyboard focus pending | Latest candidate passed coordinate Copy, flag/options and two background drags. The second drag moved saved placement by exactly +80/+40. Fixes remove the panel-only NSWindow style, disable native mouse interception, check real popup bounds and stop clearing while held. Grip removed; background/border drags and text stays selectable. Final `a0a6071` coordinate menu open/close near the screen bottom and dismiss also passed with no white/offscreen clipping. Original-editor typing/copy/delete focus and fresh human replay are separate checks. |
