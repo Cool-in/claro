@@ -1,4 +1,5 @@
 #define _WIN32_WINNT 0x0A00
+#define NOMINMAX
 #define UNICODE
 #include <windows.h>
 #include <uiautomation.h>
@@ -33,7 +34,7 @@ public:
  HRESULT STDMETHODCALLTYPE HandleFocusChangedEvent(IUIAutomationElement*) override{SetEvent(wakeEvent);return S_OK;}
 };
 LRESULT CALLBACK mouseEvent(int code,WPARAM event,LPARAM data){
- if(code>=0){auto mouse=reinterpret_cast<MSLLHOOKSTRUCT*>(data);if(event==WM_LBUTTONDOWN||event==WM_RBUTTONDOWN){DWORD pid=0;GetWindowThreadProcessId(WindowFromPoint(mouse->pt),&pid);if(pid!=parentPID){dismissPending=true;if(event==WM_LBUTTONDOWN)dragging=true;}SetEvent(wakeEvent);}else if(event==WM_LBUTTONUP){dragging=false;selectionSettled=true;selectionReadyAt=GetTickCount64()+60;SetEvent(wakeEvent);}}
+ if(code>=0){auto mouse=reinterpret_cast<MSLLHOOKSTRUCT*>(data);if(event==WM_LBUTTONDOWN||event==WM_RBUTTONDOWN){DWORD pid=0;GetWindowThreadProcessId(WindowFromPoint(mouse->pt),&pid);if(pid!=parentPID){dismissPending=true;if(event==WM_LBUTTONDOWN)dragging=true;}SetEvent(wakeEvent);}else if(event==WM_LBUTTONUP){std::cout<<"{\"kind\":\"pointer-up\"}"<<std::endl;dragging=false;selectionSettled=true;selectionReadyAt=GetTickCount64()+60;SetEvent(wakeEvent);}}
  return CallNextHookEx(nullptr,code,event,data);
 }
 LRESULT CALLBACK keyEvent(int code,WPARAM event,LPARAM data){
@@ -114,6 +115,7 @@ int main(int argc,char** argv) {
     std::string line="{\"kind\":\"clear\"}";
     HWND foreground=GetForegroundWindow();DWORD pid=0;
     GetWindowThreadProcessId(foreground,&pid);
+    if(pid==parent)line="{\"kind\":\"clear\",\"reason\":\"self\"}";
     POINT pointer;GetCursorPos(&pointer);DWORD pointerPID=0;
     GetWindowThreadProcessId(WindowFromPoint(pointer),&pointerPID);
     if(dismissPending.exchange(false))std::cout<<"{\"kind\":\"dismiss\"}"<<std::endl;
@@ -134,17 +136,17 @@ int main(int argc,char** argv) {
                 const std::wstring selected=text?std::wstring(text,SysStringLen(text)):L"";
                 if(text)SysFreeString(text);
                 if(!selected.empty()&&utf8(selected).size()<=12000) {
-                  double x=pointer.x,y=pointer.y;SAFEARRAY* rectangles=nullptr;
+                  double x=pointer.x,y=pointer.y,top=pointer.y;SAFEARRAY* rectangles=nullptr;
                   if(SUCCEEDED(range->GetBoundingRectangles(&rectangles))&&rectangles) {
                     double* data=nullptr;LONG lo=0,hi=-1;
                     SafeArrayGetLBound(rectangles,1,&lo);SafeArrayGetUBound(rectangles,1,&hi);
                     if(hi-lo>=3&&SUCCEEDED(SafeArrayAccessData(rectangles,(void**)&data))) {
-                      x=data[0];y=data[1]+data[3];SafeArrayUnaccessData(rectangles);
+                      x=data[0];top=data[1];y=data[1]+data[3];for(LONG i=4;i+3<=hi-lo;i+=4){x=std::min(x,data[i]);top=std::min(top,data[i+1]);y=std::max(y,data[i+1]+data[i+3]);}SafeArrayUnaccessData(rectangles);
                     }
                     SafeArrayDestroy(rectangles);
                   }
                   std::ostringstream output;
-                  output<<"{\"kind\":\"selection\",\"settled\":"<<(selectionSettled.exchange(false)?"true":"false")<<",\"text\":"<<quoted(utf8(selected))<<",\"app\":"<<quoted(utf8(name))<<",\"x\":"<<x<<",\"y\":"<<y<<"}";
+                  output<<"{\"kind\":\"selection\",\"settled\":"<<(selectionSettled.exchange(false)?"true":"false")<<",\"text\":"<<quoted(utf8(selected))<<",\"app\":"<<quoted(utf8(name))<<",\"x\":"<<x<<",\"y\":"<<y<<",\"top\":"<<top<<"}";
                   line=output.str();
                 }
                 range->Release();
@@ -157,7 +159,7 @@ int main(int argc,char** argv) {
       }
       element->Release();
     }
-    if(foreground!=previous) {std::cout<<"{\"kind\":\"clear\"}"<<std::endl;previous=foreground;}
+    if(foreground!=previous) {std::cout<<(pid==parent?"{\"kind\":\"clear\",\"reason\":\"self\"}":"{\"kind\":\"clear\"}")<<std::endl;previous=foreground;}
     if(line!=last) {std::cout<<line<<std::endl;last=line;}
     ULONGLONG now=GetTickCount64(),ready=selectionReadyAt;DWORD wait=ready>now?static_cast<DWORD>(std::min<ULONGLONG>(600,ready-now)):600;
     MsgWaitForMultipleObjects(1,&wakeEvent,FALSE,wait,QS_ALLINPUT);

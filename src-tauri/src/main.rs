@@ -21,6 +21,11 @@ use tauri::{
 };
 use tauri_plugin_autostart::ManagerExt;
 
+#[derive(Clone)]
+struct PendingPopup {
+    generation: u64,
+    payload: Value,
+}
 struct Core {
     settings: Mutex<Settings>,
     client: reqwest::Client,
@@ -29,10 +34,15 @@ struct Core {
     permission: AtomicBool,
     child: Mutex<Option<std::process::Child>>,
     popup_ready: AtomicBool,
-    pending_popup: Mutex<Option<Value>>,
+    popup_picker: AtomicBool,
+    popup_saved_position: Mutex<Option<(i32, i32)>>,
+    popup_dragging: AtomicBool,
+    popup_move_epoch: AtomicU64,
+    pending_popup: Mutex<Option<PendingPopup>>,
     popup_epoch: AtomicU64,
     cloud_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     status_error: Mutex<Option<String>>,
+    #[cfg(debug_assertions)]
     diagnostics: Mutex<Value>,
 }
 // Opt-in QA counters contain no source text, translation, key, app names or history.
@@ -151,18 +161,191 @@ fn save_settings(
             .map_err(|_| "Couldn't save your key securely.")?;
         }
     }
-    let path = config_path(&app);
-    std::fs::create_dir_all(path.parent().unwrap())
-        .map_err(|_| "Couldn't create settings folder.")?;
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, serde_json::to_vec(&settings).unwrap())
-        .map_err(|_| "Couldn't save settings.")?;
-    std::fs::rename(temp, path).map_err(|_| "Couldn't finish saving settings.")?;
+    persist_settings(&app, &settings)?;
     *core.settings.lock().unwrap() = settings.clone();
     offline::configure(app.clone(), settings);
     control(&core);
     core.tracker.lock().unwrap().clear();
     dismiss(&app, &core, false);
+    Ok(())
+}
+fn persist_settings(app: &tauri::AppHandle, settings: &Settings) -> Result<(), String> {
+    let path = config_path(app);
+    std::fs::create_dir_all(path.parent().unwrap())
+        .map_err(|_| "Couldn't create settings folder.")?;
+    let temp = path.with_extension("tmp");
+    std::fs::write(&temp, serde_json::to_vec(settings).unwrap())
+        .map_err(|_| "Couldn't save settings.")?;
+    std::fs::rename(temp, path).map_err(|_| "Couldn't finish saving settings.")?;
+    Ok(())
+}
+#[tauri::command]
+fn set_popup_picker(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    open: bool,
+) -> Result<(), String> {
+    if open && !core.tracker.lock().unwrap().has_active() {
+        return Err("Select some text again to choose its language.".into());
+    }
+    core.popup_picker.store(open, Ordering::SeqCst);
+    qa(
+        &app,
+        &core,
+        if open {
+            "picker_opened"
+        } else {
+            "picker_closed"
+        },
+    );
+    Ok(())
+}
+
+fn placement_path(app: &tauri::AppHandle) -> std::path::PathBuf {
+    app.path()
+        .app_config_dir()
+        .unwrap()
+        .join("popup-position.json")
+}
+fn save_placement(app: &tauri::AppHandle, position: (i32, i32)) {
+    let path = placement_path(app);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&position) {
+        let temp = path.with_extension("tmp");
+        if std::fs::write(&temp, bytes).is_ok() {
+            let _ = std::fs::rename(temp, path);
+        }
+    }
+}
+#[tauri::command]
+fn start_popup_drag(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+    let window = app
+        .get_webview_window("popup")
+        .ok_or("The translation panel is closed.")?;
+    core.popup_dragging.store(true, Ordering::SeqCst);
+    if window.start_dragging().is_err() {
+        core.popup_dragging.store(false, Ordering::SeqCst);
+        return Err("Couldn't move the translation panel.".into());
+    }
+    Ok(())
+}
+#[tauri::command]
+fn follow_selection(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+    core.popup_move_epoch.fetch_add(1, Ordering::SeqCst);
+    core.popup_dragging.store(false, Ordering::SeqCst);
+    *core.popup_saved_position.lock().unwrap() = None;
+    match std::fs::remove_file(placement_path(&app)) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return Err("Couldn't reset the saved popup position.".into()),
+    }
+    let anchor = { core.tracker.lock().unwrap().anchor() };
+    if let (Some(window), Some((x, y, top))) = (app.get_webview_window("popup"), anchor) {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let size = window
+            .inner_size()
+            .unwrap_or(tauri::PhysicalSize::new(232, 84));
+        position_popup(
+            &window,
+            x,
+            y,
+            top,
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+        );
+    }
+    qa(&app, &core, "placement_reset");
+    Ok(())
+}
+fn place_popup(
+    core: &Arc<Core>,
+    window: &tauri::WebviewWindow,
+    x: f64,
+    y: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+) {
+    if core.popup_dragging.load(Ordering::SeqCst) {
+        return;
+    }
+    let saved = { *core.popup_saved_position.lock().unwrap() };
+    if let Some((x, y)) = saved {
+        let size = window
+            .outer_size()
+            .unwrap_or(tauri::PhysicalSize::new(width as u32, height as u32));
+        let mut result = (x, y);
+        if let Ok(monitors) = window.available_monitors() {
+            if let Some(monitor) = monitors
+                .iter()
+                .find(|m| {
+                    let p = m.position();
+                    let z = m.size();
+                    x >= p.x && x < p.x + z.width as i32 && y >= p.y && y < p.y + z.height as i32
+                })
+                .or_else(|| monitors.first())
+            {
+                let p = monitor.position();
+                let z = monitor.size();
+                result.0 = x.clamp(
+                    p.x + 8,
+                    (p.x + z.width as i32 - size.width as i32 - 8).max(p.x + 8),
+                );
+                result.1 = y.clamp(
+                    p.y + 8,
+                    (p.y + z.height as i32 - size.height as i32 - 8).max(p.y + 8),
+                );
+            }
+        }
+        let _ = window.set_position(tauri::PhysicalPosition::new(result.0, result.1));
+    } else {
+        position_popup(window, x, y, top, width, height);
+    }
+}
+#[tauri::command]
+fn change_popup_target(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    target: String,
+) -> Result<(), String> {
+    if !LANGUAGES.contains(&target.as_str()) {
+        return Err("Choose a supported target language.".into());
+    }
+    if core.paused.load(Ordering::SeqCst) {
+        return Err("Resume Claro before translating.".into());
+    }
+    let mut settings = core.settings.lock().unwrap().clone();
+    if !settings.consent {
+        return Err("Automatic translation is turned off.".into());
+    }
+    let (generation, selection) = core
+        .tracker
+        .lock()
+        .unwrap()
+        .retarget()
+        .ok_or("Select some text again before changing its language.")?;
+    if settings
+        .excluded_apps
+        .iter()
+        .any(|app| app.eq_ignore_ascii_case(&selection.app))
+    {
+        return Err("This app is excluded from automatic translation.".into());
+    }
+    settings.target = target;
+    persist_settings(&app, &settings)?;
+    *core.settings.lock().unwrap() = settings.clone();
+    let _ = app.emit_to("settings", "state-changed", ());
+    qa(&app, &core, "target_changed");
+    spawn_translation(
+        app,
+        core.inner().clone(),
+        settings,
+        selection,
+        generation,
+        0,
+    );
     Ok(())
 }
 #[tauri::command]
@@ -194,6 +377,7 @@ fn abort_cloud(core: &Arc<Core>) {
 fn dismiss(app: &tauri::AppHandle, core: &Arc<Core>, remember: bool) {
     qa(app, core, if remember { "dismiss" } else { "clear" });
     abort_cloud(core);
+    core.popup_picker.store(false, Ordering::SeqCst);
     core.tracker.lock().unwrap().dismiss(remember);
     if let Some(w) = app.get_webview_window("popup") {
         let _ = w.hide();
@@ -331,6 +515,8 @@ const LANGUAGES: &[&str] = &[
 struct Capture {
     kind: String,
     #[serde(default)]
+    reason: String,
+    #[serde(default)]
     trusted: bool,
     #[serde(default)]
     settled: bool,
@@ -342,6 +528,8 @@ struct Capture {
     x: f64,
     #[serde(default)]
     y: f64,
+    #[serde(default)]
+    top: f64,
 }
 fn capture(app: tauri::AppHandle, core: Arc<Core>) {
     std::thread::spawn(move || {
@@ -397,11 +585,34 @@ fn capture(app: tauri::AppHandle, core: Arc<Core>) {
                 let _ = app.emit("state-changed", ());
                 continue;
             }
+            if event.kind == "pointer-up" {
+                if core.popup_dragging.load(Ordering::SeqCst) {
+                    let app = app.clone();
+                    let core = core.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if let Some(window) = app.get_webview_window("popup") {
+                            if let Ok(position) = window.outer_position() {
+                                let value = (position.x, position.y);
+                                *core.popup_saved_position.lock().unwrap() = Some(value);
+                                core.popup_move_epoch.fetch_add(1, Ordering::SeqCst);
+                                save_placement(&app, value);
+                                qa(&app, &core, "placement_saved");
+                            }
+                        }
+                        core.popup_dragging.store(false, Ordering::SeqCst);
+                    });
+                }
+                continue;
+            }
             if event.kind == "dismiss" {
                 dismiss(&app, &core, true);
                 continue;
             }
             if event.kind == "clear" {
+                if event.reason == "self" && core.pending_popup.lock().unwrap().is_some() {
+                    continue;
+                }
                 core.tracker.lock().unwrap().clear();
 
                 dismiss(&app, &core, false);
@@ -432,64 +643,89 @@ fn capture(app: tauri::AppHandle, core: Arc<Core>) {
                 continue;
             };
             qa(&app, &core, "selection_accepted");
-            abort_cloud(&core);
-            let is_cloud = settings.mode == "cloud";
-            let owner = core.clone();
-            let app = app.clone();
-            let core = core.clone();
-            let task = tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(if event.settled { 30 } else { 150 }))
-                    .await;
-                if !core.tracker.lock().unwrap().is_current(generation) {
-                    return;
-                }
-                core.tracker.lock().unwrap().started(generation);
-                if !show_popup(&app, &core, event.x, event.y) {
-                    return;
-                }
-                if !emit_current(
-                    &app,
-                    &core,
-                    generation,
-                    json!({"state":"loading","target":settings.target,"mode":settings.mode}),
-                ) {
-                    return;
-                }
-                qa(&app, &core, "translation_started");
-                let result = if settings.mode == "offline" {
-                    offline::translate_auto(&app, &settings, &event.text, core.clone(), generation)
-                        .await
-                } else {
-                    match key_for(&settings) {
-                        Ok(k) => {
-                            provider::translate(&core.client, &settings, &k, &event.text).await
-                        }
-                        Err(e) => Err(e),
-                    }
-                };
-                if !core.tracker.lock().unwrap().is_current(generation) {
-                    return;
-                }
-                qa(&app, &core, "translation_completed");
-                let payload = match result {
-                    Ok(text) => {
-                        json!({"state":"ready","text":text,"target":settings.target,"mode":settings.mode})
-                    }
-                    Err(error) => {
-                        json!({"state":"error","error":error,"target":settings.target,"mode":settings.mode})
-                    }
-                };
-                emit_current(&app, &core, generation, payload);
-            });
-            if is_cloud {
-                *owner.cloud_task.lock().unwrap() = Some(task);
-            }
+            core.tracker
+                .lock()
+                .unwrap()
+                .set_anchor(generation, event.x, event.y);
+            core.tracker.lock().unwrap().set_top(generation, event.top);
+            let delay = if event.settled { 30 } else { 150 };
+            let selection = selection::ActiveSelection {
+                app: event.app,
+                text: event.text,
+                x: event.x,
+                y: event.y,
+                top: event.top,
+            };
+            spawn_translation(
+                app.clone(),
+                core.clone(),
+                settings,
+                selection,
+                generation,
+                delay,
+            );
         }
         if let Some(mut child) = core.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     });
+}
+fn spawn_translation(
+    app: tauri::AppHandle,
+    core: Arc<Core>,
+    settings: Settings,
+    selection: selection::ActiveSelection,
+    generation: u64,
+    delay_ms: u64,
+) {
+    abort_cloud(&core);
+    let is_cloud = settings.mode == "cloud";
+    let owner = core.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if !core.tracker.lock().unwrap().is_current(generation) {
+            return;
+        }
+        core.tracker.lock().unwrap().started(generation);
+        if !show_popup(&app, &core, selection.x, selection.y, selection.top) {
+            return;
+        }
+        if !emit_current(
+            &app,
+            &core,
+            generation,
+            json!({"state":"loading","target":settings.target,"mode":settings.mode}),
+        ) {
+            return;
+        }
+        qa(&app, &core, "translation_started");
+        let result = if settings.mode == "offline" {
+            offline::translate_auto(&app, &settings, &selection.text, core.clone(), generation)
+                .await
+        } else {
+            match key_for(&settings) {
+                Ok(k) => provider::translate(&core.client, &settings, &k, &selection.text).await,
+                Err(e) => Err(e),
+            }
+        };
+        if !core.tracker.lock().unwrap().is_current(generation) {
+            return;
+        }
+        qa(&app, &core, "translation_completed");
+        let payload = match result {
+            Ok(text) => {
+                json!({"state":"ready","text":text,"target":settings.target,"mode":settings.mode})
+            }
+            Err(error) => {
+                json!({"state":"error","error":error,"target":settings.target,"mode":settings.mode})
+            }
+        };
+        emit_current(&app, &core, generation, payload);
+    });
+    if is_cloud {
+        *owner.cloud_task.lock().unwrap() = Some(task);
+    }
 }
 fn ensure_popup(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> {
     if app.get_webview_window("popup").is_some() {
@@ -503,7 +739,7 @@ fn ensure_popup(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> 
         tauri::WebviewUrl::App("index.html?popup".into()),
     )
     .title("Claro translation")
-    .inner_size(336.0, 180.0)
+    .inner_size(232.0, 84.0)
     .visible(false)
     .decorations(false)
     .transparent(true)
@@ -533,33 +769,74 @@ fn ensure_popup(app: &tauri::AppHandle, core: &Arc<Core>) -> Result<(), String> 
     }
     Ok(())
 }
-fn emit_current(app: &tauri::AppHandle, core: &Arc<Core>, generation: u64, payload: Value) -> bool {
-    let tracker = core.tracker.lock().unwrap();
-    if !tracker.is_current(generation) || core.paused.load(Ordering::SeqCst) {
-        return false;
-    }
-    emit_popup(app, core, payload);
-    true
+fn valid_popup(tracker: &selection::SelectionTracker, paused: bool, generation: u64) -> bool {
+    tracker.is_current(generation) && !paused
 }
-fn emit_popup(app: &tauri::AppHandle, core: &Arc<Core>, payload: Value) {
-    *core.pending_popup.lock().unwrap() = Some(payload.clone());
-    if core.popup_ready.load(Ordering::SeqCst) {
-        let _ = app.emit_to("popup", "translation", payload);
-        if let Some(w) = app.get_webview_window("popup") {
-            let _ = w.show();
-            qa(app, core, "popup_show");
+fn deliver_popup(app: &tauri::AppHandle, core: &Arc<Core>, generation: u64) {
+    let handle = app.clone();
+    let core = core.clone();
+    let _ = app.run_on_main_thread(move || {
+        // Never dispatch UI while holding a mutex. run_on_main_thread runs inline
+        // when called by a command, so nested tracker locks would deadlock.
+        let payload = {
+            let tracker = core.tracker.lock().unwrap();
+            if !valid_popup(&tracker, core.paused.load(Ordering::SeqCst), generation) {
+                return;
+            }
+            let pending = core.pending_popup.lock().unwrap();
+            match pending.as_ref() {
+                Some(value) if value.generation == generation => value.payload.clone(),
+                _ => return,
+            }
+        };
+        let _ = handle.emit_to("popup", "translation", payload);
+        if let Some(window) = handle.get_webview_window("popup") {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                use objc::{msg_send, sel, sel_impl};
+                if let Ok(pointer) = window.ns_window() {
+                    let ns = pointer as *mut objc::runtime::Object;
+                    let _: () = msg_send![ns, orderFrontRegardless];
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = window.show();
+            qa(&handle, &core, "popup_show");
         }
+    });
+}
+fn emit_current(app: &tauri::AppHandle, core: &Arc<Core>, generation: u64, payload: Value) -> bool {
+    {
+        let tracker = core.tracker.lock().unwrap();
+        if !valid_popup(&tracker, core.paused.load(Ordering::SeqCst), generation) {
+            return false;
+        }
+        *core.pending_popup.lock().unwrap() = Some(PendingPopup {
+            generation,
+            payload,
+        });
     }
+    if core.popup_ready.load(Ordering::SeqCst) {
+        deliver_popup(app, core, generation);
+    }
+    true
 }
 #[tauri::command]
 fn popup_ready(app: tauri::AppHandle, core: State<Arc<Core>>) {
     core.popup_ready.store(true, Ordering::SeqCst);
     qa(&app, &core, "renderer_ready");
-    let payload = core.pending_popup.lock().unwrap().clone();
-    if let Some(payload) = payload {
-        emit_popup(&app, &core, payload);
+    let generation = {
+        core.pending_popup
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|value| value.generation)
+    };
+    if let Some(generation) = generation {
+        deliver_popup(&app, &core, generation);
     }
 }
+
 #[tauri::command]
 fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     let result = if enabled {
@@ -572,7 +849,7 @@ fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<(), Strin
             .into()
     })
 }
-fn show_popup(app: &tauri::AppHandle, core: &Arc<Core>, x: f64, y: f64) -> bool {
+fn show_popup(app: &tauri::AppHandle, core: &Arc<Core>, x: f64, y: f64, top: f64) -> bool {
     core.popup_epoch.fetch_add(1, Ordering::SeqCst);
     if let Err(error) = ensure_popup(app, core) {
         *core.status_error.lock().unwrap() = Some(error.clone());
@@ -581,54 +858,67 @@ fn show_popup(app: &tauri::AppHandle, core: &Arc<Core>, x: f64, y: f64) -> bool 
     }
     *core.status_error.lock().unwrap() = None;
     if let Some(w) = app.get_webview_window("popup") {
-        let mut px = x;
-        let mut py = y + 10.0;
-        if let Ok(monitors) = w.available_monitors() {
-            for m in monitors {
-                let scale = m.scale_factor();
-                let p = m.position();
-                let size = m.size();
-                #[cfg(windows)]
-                {
-                    let left = p.x as f64;
-                    let top = p.y as f64;
-                    let right = left + size.width as f64;
-                    let bottom = top + size.height as f64;
-                    if x >= left && x <= right && y >= top && y <= bottom {
-                        let px = x.clamp(
-                            left + 12.0 * scale,
-                            (right - 348.0 * scale).max(left + 12.0 * scale),
-                        );
-                        let py = if y + 290.0 * scale > bottom {
-                            (y - 280.0 * scale).max(top + 12.0 * scale)
-                        } else {
-                            y + 10.0 * scale
-                        };
-                        let _ = w.set_position(tauri::PhysicalPosition::new(px as i32, py as i32));
-                        return true;
-                    }
-                }
-                let left = p.x as f64 / scale;
-                let top = p.y as f64 / scale;
-                let right = left + size.width as f64 / scale;
-                let bottom = top + size.height as f64 / scale;
-                if x >= left && x <= right && y >= top && y <= bottom {
-                    px = x.clamp(left + 12.0, right - 348.0);
-                    py = if py + 250.0 > bottom {
-                        (y - 240.0).max(top + 12.0)
-                    } else {
-                        py
-                    };
-                    break;
-                }
-            }
-        }
-        let _ = w.set_position(tauri::LogicalPosition::new(px, py));
+        place_popup(core, &w, x, y, top, 232.0, 84.0);
         return true;
     }
     false
 }
+fn position_popup(
+    w: &tauri::WebviewWindow,
+    x: f64,
+    y: f64,
+    selection_top: f64,
+    width: f64,
+    height: f64,
+) {
+    let mut px = x;
+    let mut py = y + 10.0;
+    if let Ok(monitors) = w.available_monitors() {
+        for m in monitors {
+            let scale = m.scale_factor();
+            let p = m.position();
+            let size = m.size();
+            #[cfg(windows)]
+            {
+                let left = p.x as f64;
+                let top = p.y as f64;
+                let right = left + size.width as f64;
+                let bottom = top + size.height as f64;
+                if x >= left && x <= right && y >= top && y <= bottom {
+                    let px = x.clamp(
+                        left + 12.0 * scale,
+                        (right - (width + 12.0) * scale).max(left + 12.0 * scale),
+                    );
+                    let py = if y + (height + 10.0) * scale > bottom {
+                        (selection_top - (height + 10.0) * scale).max(top + 12.0 * scale)
+                    } else {
+                        y + 10.0 * scale
+                    };
+                    let _ = w.set_position(tauri::PhysicalPosition::new(px as i32, py as i32));
+                    return;
+                }
+            }
+            let left = p.x as f64 / scale;
+            let top = p.y as f64 / scale;
+            let right = left + size.width as f64 / scale;
+            let bottom = top + size.height as f64 / scale;
+            if x >= left && x <= right && y >= top && y <= bottom {
+                px = x.clamp(left + 12.0, right - width - 12.0);
+                py = if py + height > bottom {
+                    (selection_top - height - 10.0).max(top + 12.0)
+                } else {
+                    py
+                };
+                break;
+            }
+        }
+    }
+    let _ = w.set_position(tauri::LogicalPosition::new(px, py));
+}
 fn settings(app: &tauri::AppHandle, manual: bool) {
+    if let Some(core) = app.try_state::<Arc<Core>>() {
+        dismiss(app, &core, false);
+    }
     if app.get_webview_window("settings").is_none() {
         let builder = tauri::WebviewWindowBuilder::new(
             app,
@@ -675,9 +965,15 @@ fn popup_rendered(app: tauri::AppHandle, core: State<Arc<Core>>, state: String) 
     }
 }
 #[tauri::command]
-fn resize_popup(app: tauri::AppHandle, height: f64) {
+fn resize_popup(app: tauri::AppHandle, core: State<Arc<Core>>, width: f64, height: f64) {
     if let Some(w) = app.get_webview_window("popup") {
-        let _ = w.set_size(tauri::LogicalSize::new(336.0, height.clamp(118.0, 280.0)));
+        let width = width.clamp(176.0, 336.0);
+        let height = height.clamp(64.0, 380.0);
+        let _ = w.set_size(tauri::LogicalSize::new(width, height));
+        let anchor = { core.tracker.lock().unwrap().anchor() };
+        if let Some((x, y, top)) = anchor {
+            place_popup(&core, &w, x, y, top, width, height);
+        }
     }
 }
 fn main() {
@@ -694,10 +990,15 @@ fn main() {
         permission: AtomicBool::new(!cfg!(target_os = "macos")),
         child: Mutex::new(None),
         popup_ready: AtomicBool::new(false),
+        popup_picker: AtomicBool::new(false),
+        popup_saved_position: Mutex::new(None),
+        popup_dragging: AtomicBool::new(false),
+        popup_move_epoch: AtomicU64::new(0),
         pending_popup: Mutex::new(None),
         popup_epoch: AtomicU64::new(0),
         cloud_task: Mutex::new(None),
         status_error: Mutex::new(None),
+        #[cfg(debug_assertions)]
         diagnostics: Mutex::new(json!({})),
     });
     tauri::Builder::default()
@@ -714,7 +1015,7 @@ fn main() {
             activate_license,
             download_model,
             open_purchase,
-            open_accessibility,copy_translation,resize_popup,popup_ready,set_launch_at_login,popup_rendered
+            open_accessibility,copy_translation,resize_popup,popup_ready,set_launch_at_login,popup_rendered,change_popup_target,set_popup_picker,start_popup_drag,follow_selection
         ])
         .setup(move |app| {
             let path = config_path(app.handle());
@@ -723,6 +1024,7 @@ fn main() {
                     *core.settings.lock().unwrap() = s;
                 }
             }
+            if let Ok(bytes)=std::fs::read(placement_path(app.handle())){if let Ok(position)=serde_json::from_slice::<(i32,i32)>(&bytes){*core.popup_saved_position.lock().unwrap()=Some(position);}}
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let pause = MenuItem::with_id(app, "pause", "Pause / resume", true, None::<&str>)?;
@@ -783,8 +1085,27 @@ fn main() {
             offline::configure(handle.clone(),core.settings.lock().unwrap().clone());
             capture(handle.clone(), core.clone());
             if !std::env::args().any(|a|a=="--background"){settings(&handle,false);}
-            #[cfg(debug_assertions)]if std::env::args().any(|a|a=="--preview-popup"){let preview_app=handle.clone();let preview_core=core.clone();tauri::async_runtime::spawn(async move {tokio::time::sleep(Duration::from_millis(1600)).await;show_popup(&preview_app,&preview_core,660.0,300.0);emit_popup(&preview_app,&preview_core,json!({"state":"ready","text":"Hay un mundo entero esperando a ser entendido.","target":"Spanish","mode":"offline"}));});}
+            #[cfg(debug_assertions)]if std::env::args().any(|a|a=="--preview-popup"){
+              let preview_app=handle.clone();let preview_core=core.clone();
+              tauri::async_runtime::spawn(async move{
+                tokio::time::sleep(Duration::from_millis(1600)).await;
+                let generation={let mut tracker=preview_core.tracker.lock().unwrap();let Some(generation)=tracker.select("claro.qa.fixture","Good morning.")else{return;};tracker.set_anchor(generation,660.0,300.0);tracker.started(generation);generation};
+                qa(&preview_app,&preview_core,"preview_seeded");
+                if show_popup(&preview_app,&preview_core,660.0,300.0,280.0){emit_current(&preview_app,&preview_core,generation,json!({"state":"ready","text":"Buen día.","target":"Spanish","mode":"offline"}));}
+              });
+            }
             Ok(())
+        })
+        .on_window_event(|window,event|{
+          if window.label()!="popup"{return;}
+          let core=window.state::<Arc<Core>>();
+          if let tauri::WindowEvent::Moved(position)=event{
+            if !core.popup_dragging.load(Ordering::SeqCst){return;}
+            let value=(position.x,position.y);*core.popup_saved_position.lock().unwrap()=Some(value);
+            let epoch=core.popup_move_epoch.fetch_add(1,Ordering::SeqCst)+1;
+            let core=core.inner().clone();let app=window.app_handle().clone();
+            tauri::async_runtime::spawn(async move{tokio::time::sleep(Duration::from_millis(250)).await;if core.popup_move_epoch.load(Ordering::SeqCst)==epoch{save_placement(&app,value);qa(&app,&core,"placement_saved");}});
+          }
         })
         .build(tauri::generate_context!())
         .expect("Couldn't start Claro")
@@ -835,5 +1156,22 @@ mod test_http {
             write!(stream,"HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",status,body.len(),body).unwrap();
         });
         (url, rx)
+    }
+}
+
+#[cfg(test)]
+mod popup_race_tests {
+    use super::*;
+    #[test]
+    fn renderer_ready_cannot_restore_payload_after_clear_or_pause() {
+        let mut tracker = selection::SelectionTracker::default();
+        let generation = tracker.select("fixture", "synthetic text").unwrap();
+        assert!(valid_popup(&tracker, false, generation));
+        assert!(!valid_popup(&tracker, true, generation));
+        tracker.clear();
+        assert!(!valid_popup(&tracker, false, generation));
+        let next = tracker.select("fixture", "different text").unwrap();
+        assert!(!valid_popup(&tracker, false, generation));
+        assert!(valid_popup(&tracker, false, next));
     }
 }

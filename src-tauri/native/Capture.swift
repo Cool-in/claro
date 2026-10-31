@@ -28,7 +28,8 @@ func poll(settled: Bool = false) {
     guard enabled && !suspended && !dragging else { output(["kind":"clear"]); return }
     guard let front = NSWorkspace.shared.frontmostApplication else { output(["kind":"clear"]); return }
     let identifier = front.bundleIdentifier ?? front.localizedName ?? "unknown"
-    if front.processIdentifier == getpid() || identifier == "app.claro.translate" || excluded.contains(where: { $0.caseInsensitiveCompare(identifier) == .orderedSame }) { output(["kind":"clear"]); return }
+    if front.processIdentifier == getpid() || identifier == "app.claro.translate" { output(["kind":"clear","reason":"self"]); return }
+    if excluded.contains(where: { $0.caseInsensitiveCompare(identifier) == .orderedSame }) { output(["kind":"clear"]); return }
     if front.processIdentifier != observedPID {
         if let old = observer { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(old), .commonModes) }
         observedPID = front.processIdentifier
@@ -62,7 +63,7 @@ func poll(settled: Bool = false) {
             if AXValueGetValue(unsafeBitCast(bounds,to:AXValue.self), .cgRect, &candidate), !candidate.isEmpty { rect = candidate }
         }
     }
-    output(["kind":"selection","settled":settled,"text":text,"app":identifier,"x":rect.minX,"y":rect.maxY,"width":rect.width])
+    output(["kind":"selection","settled":settled,"text":text,"app":identifier,"x":rect.minX,"y":rect.maxY,"top":rect.minY,"width":rect.width])
 }
 let _ = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDown,.keyDown]) { event in
     if event.type == .keyDown && event.keyCode != 53 { return }
@@ -80,10 +81,10 @@ let _ = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDo
     output(["kind":"dismiss"])
 }
 let _ = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseUp,.keyUp]) { event in
- if event.type == .leftMouseUp { dragging = false; DispatchQueue.main.asyncAfter(deadline:.now()+0.06) { poll(settled:true) } }
+ if event.type == .leftMouseUp { output(["kind":"pointer-up"]); dragging = false; DispatchQueue.main.asyncAfter(deadline:.now()+0.06) { poll(settled:true) } }
  else if (123...126).contains(Int(event.keyCode)) || event.modifierFlags.contains(.shift) { poll() }
 }
-NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.didActivateApplicationNotification,object:nil,queue:.main) { _ in output(["kind":"clear"]); poll() }
+NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.didActivateApplicationNotification,object:nil,queue:.main) { _ in let own = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "app.claro.translate"; output(["kind":"clear","reason":own ? "self" : "app-switch"]); poll() }
 NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.sessionDidResignActiveNotification,object:nil,queue:.main) { _ in suspended = true; output(["kind":"clear"]) }
 NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.sessionDidBecomeActiveNotification,object:nil,queue:.main) { _ in suspended = false; poll() }
 DistributedNotificationCenter.default().addObserver(forName:NSNotification.Name("com.apple.screenIsLocked"),object:nil,queue:.main) { _ in suspended = true; output(["kind":"clear"]) }

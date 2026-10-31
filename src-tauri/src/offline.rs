@@ -273,6 +273,9 @@ fn should_unload(keep: bool, idle: std::time::Duration) -> bool {
     !keep && idle >= std::time::Duration::from_secs(60)
 }
 fn schedule_idle_unload() {
+    if KEEP_WARM.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     tauri::async_runtime::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let mut slot = WORKER.lock().await;
