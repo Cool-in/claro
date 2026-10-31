@@ -10,5 +10,8 @@
   "nativeTokenizer": "SentencePiece 0.2.1",
   "sourceTokens": "__SOURCE_ISO639_1__ + SentencePiece pieces + </s>",
   "targetPrefix": "__TARGET_ISO639_1__",
-  "downloadRelease": "Not published. release.json intentionally has no model URLs."
+  "downloadRelease": "Not published. release.json intentionally has no model URLs.",
+  "autoConvertedSafetensorsRevision": "ae6407352f7f86e328c0f0678d466fc4246e78b3",
+  "conversionCommand": "ct2-transformers-converter --model facebook/m2m100_418M --output_dir /stable/Claro/offline-model/m2m100-int8 --quantization int8 --copy_files sentencepiece.bpe.model tokenizer_config.json vocab.json special_tokens_map.json",
+  "revisionEvidence": "The original conversion resolved main to sourceRevision; subsequent reproducible conversions should pass --revision explicitly."
 }
