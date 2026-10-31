@@ -2,7 +2,7 @@
 
 A quiet desktop translator for macOS and Windows. Highlight text in another app and a small, nonactivating panel appears beside the selection. Spanish is the default target language. Source detection and a manual source override are available.
 
-Free download with your own OpenAI or OpenAI-compatible API key. A planned $10 lifetime Polar purchase unlocks an optional local translation model on both platforms. This repository is private. No workflow publishes source or creates a public release.
+Free download with your own OpenAI or OpenAI-compatible API key. A planned $10 lifetime Polar purchase unlocks an optional local translation model on both platforms. Source stays private in `Cool-in/claro`. Approved public binaries and models use the separate `Cool-in/claro-downloads` repository. The model release is https://github.com/Cool-in/claro-downloads/releases/tag/model-m2m100-int8-v1 . CI does not publish source or automatically create an installer release.
 
 ## What is implemented
 

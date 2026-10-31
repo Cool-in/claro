@@ -44,3 +44,15 @@ Final handoff: candidate `a0a6071`, debug background process PID 61650 remains a
 Final available APFS space: 69,731,504,128 bytes (64.94 GiB). No new cleanup/reclaimed-space claim for this iteration.
 
 Settings-drag handoff: PID 62803 remains running with Settings visible and the existing offline QA flags. This iteration reused the same stable debug cache and app bundle; no new generated directory or successful full log was created.
+
+## Beta packaging checkpoint
+
+- Source candidate `8c21b5e` includes settings background dragging and verified public model downloads. The user confirmed clicks and dragging now work.
+- Public distribution route: https://github.com/Cool-in/claro-downloads ; source repository Cool-in/claro remains private.
+- Mac Apple-silicon release app built at 10.42 MiB, Developer ID signed, notarization submission `0b3efa60-7dff-49c7-ba9f-dc34970000eb` Accepted, ticket stapled/validated, Gatekeeper accepted as Notarized Developer ID. ZIP SHA-256 `430818c61c67bedff6b5766bbf9ca85908bd7044f71a6c3833535628e8b9f4fd`. This is build/distribution verification, not a new installed-app runtime pass.
+- Windows CI `41209472734` passed for source `8c21b5e`, including tests and the NSIS installer. The unsigned installer is 3,368,102 bytes; SHA-256 `d0d20f5ca68c76acf386bcd8be403f7bfe1596eb79ed72e85495a64ae9d96f68`.
+- Polar now has a private one-use 100% test discount, and its product website points to the public download repository. The owner must complete free checkout to receive a real key. Paid sales remain blocked by payout setup and account review. No buyer terms or payout setup were completed by the agent.
+- The existing debug app PID 62803 remains running with the user-confirmed mouse fixes; no production-license bypass is included in the release.
+
+- Beta published: https://github.com/Cool-in/claro-downloads/releases/tag/v0.1.0-beta.1 . Both Mac ZIP and Windows installer passed anonymous public download with SHA-256 matching the local artifacts; SHA256SUMS.txt is included. This is a prerelease, and Windows runtime/license activation remain unverified until the owner tests.
+- The real free checkout was opened with the one-use discount applied and visibly showed US$0. No checkout was submitted and no license key was issued by the agent. Paid-sales setup still requires the owner to connect a payout account and submit Polar account review.
