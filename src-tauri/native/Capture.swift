@@ -5,6 +5,8 @@ import ApplicationServices
 let app = NSApplication.shared
 app.setActivationPolicy(.prohibited)
 var enabled = false
+var dragging = false
+var lastTrust: Bool?
 var suspended = false
 var excluded: [String] = []
 var last = ""
@@ -19,9 +21,11 @@ func value(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
     var result: CFTypeRef?
     return AXUIElementCopyAttributeValue(element, key as CFString, &result) == .success ? result : nil
 }
-func poll() {
-    guard AXIsProcessTrusted() else { output(["kind":"permission"]); return }
-    guard enabled && !suspended else { output(["kind":"clear"]); return }
+func poll(settled: Bool = false) {
+    let trusted = AXIsProcessTrusted()
+    if lastTrust != trusted { lastTrust = trusted; output(["kind":"status","trusted":trusted]) }
+    guard trusted else { return }
+    guard enabled && !suspended && !dragging else { output(["kind":"clear"]); return }
     guard let front = NSWorkspace.shared.frontmostApplication else { output(["kind":"clear"]); return }
     let identifier = front.bundleIdentifier ?? front.localizedName ?? "unknown"
     if front.processIdentifier == getpid() || identifier == "app.claro.translate" || excluded.contains(where: { $0.caseInsensitiveCompare(identifier) == .orderedSame }) { output(["kind":"clear"]); return }
@@ -58,7 +62,7 @@ func poll() {
             if AXValueGetValue(unsafeBitCast(bounds,to:AXValue.self), .cgRect, &candidate), !candidate.isEmpty { rect = candidate }
         }
     }
-    output(["kind":"selection","text":text,"app":identifier,"x":rect.minX,"y":rect.maxY,"width":rect.width])
+    output(["kind":"selection","settled":settled,"text":text,"app":identifier,"x":rect.minX,"y":rect.maxY,"width":rect.width])
 }
 let _ = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDown,.keyDown]) { event in
     if event.type == .keyDown && event.keyCode != 53 { return }
@@ -72,10 +76,12 @@ let _ = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDo
         break
       }
     }
+    if event.type == .leftMouseDown { dragging = true }
     output(["kind":"dismiss"])
 }
 let _ = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseUp,.keyUp]) { event in
- if event.type == .leftMouseUp || (123...126).contains(Int(event.keyCode)) || event.modifierFlags.contains(.shift) { poll() }
+ if event.type == .leftMouseUp { dragging = false; DispatchQueue.main.asyncAfter(deadline:.now()+0.06) { poll(settled:true) } }
+ else if (123...126).contains(Int(event.keyCode)) || event.modifierFlags.contains(.shift) { poll() }
 }
 NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.didActivateApplicationNotification,object:nil,queue:.main) { _ in output(["kind":"clear"]); poll() }
 NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.sessionDidResignActiveNotification,object:nil,queue:.main) { _ in suspended = true; output(["kind":"clear"]) }

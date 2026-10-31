@@ -2,7 +2,10 @@
 import json, pathlib, subprocess, sys, time
 runner,model=map(pathlib.Path,sys.argv[1:3])
 worker=subprocess.Popen([str(runner),'--server',str(model)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
-samples=[('cold','Good morning. How are you today?','en','es'),('warm','Where is the train station?','en','es'),('warm','Bonjour, je voudrais un café, s’il vous plaît.','fr','es'),('long-rejection','A small tool must never silently discard the last words of a selected paragraph. '*90,'en','es'),('after-rejection','Thank you for your help.','en','es')]
+samples=[('first-warm','Good morning. How are you today?','en','es'),('warm','Where is the train station?','en','es'),('warm','Bonjour, je voudrais un café, s’il vous plaît.','fr','es'),('long-rejection','A small tool must never silently discard the last words of a selected paragraph. '*90,'en','es'),('after-rejection','Thank you for your help.','en','es')]
+startup=time.perf_counter()
+assert json.loads(worker.stdout.readline()).get('ready') is True
+print(json.dumps({'modelReadySeconds':round(time.perf_counter()-startup,3)}),flush=True)
 for index,(name,text,source,target)in enumerate(samples,1):
     started=time.perf_counter()
     worker.stdin.write(json.dumps({'id':index,'text':text,'source':source,'target':target})+'\n');worker.stdin.flush()

@@ -16,6 +16,8 @@ std::mutex exclusionMutex;
 std::vector<std::wstring> excluded;
 HANDLE wakeEvent=nullptr;
 std::atomic<bool> dismissPending(false);
+std::atomic<bool> dragging(false), selectionSettled(false);
+std::atomic<ULONGLONG> selectionReadyAt(0);
 DWORD parentPID=0;
 class SelectionEvents final: public IUIAutomationEventHandler, public IUIAutomationFocusChangedEventHandler {
   std::atomic<ULONG> references{1};
@@ -31,7 +33,7 @@ public:
  HRESULT STDMETHODCALLTYPE HandleFocusChangedEvent(IUIAutomationElement*) override{SetEvent(wakeEvent);return S_OK;}
 };
 LRESULT CALLBACK mouseEvent(int code,WPARAM event,LPARAM data){
- if(code>=0){auto mouse=reinterpret_cast<MSLLHOOKSTRUCT*>(data);if(event==WM_LBUTTONDOWN||event==WM_RBUTTONDOWN){DWORD pid=0;GetWindowThreadProcessId(WindowFromPoint(mouse->pt),&pid);if(pid!=parentPID)dismissPending=true;SetEvent(wakeEvent);}else if(event==WM_LBUTTONUP)SetEvent(wakeEvent);}
+ if(code>=0){auto mouse=reinterpret_cast<MSLLHOOKSTRUCT*>(data);if(event==WM_LBUTTONDOWN||event==WM_RBUTTONDOWN){DWORD pid=0;GetWindowThreadProcessId(WindowFromPoint(mouse->pt),&pid);if(pid!=parentPID){dismissPending=true;if(event==WM_LBUTTONDOWN)dragging=true;}SetEvent(wakeEvent);}else if(event==WM_LBUTTONUP){dragging=false;selectionSettled=true;selectionReadyAt=GetTickCount64()+60;SetEvent(wakeEvent);}}
  return CallNextHookEx(nullptr,code,event,data);
 }
 LRESULT CALLBACK keyEvent(int code,WPARAM event,LPARAM data){
@@ -106,6 +108,7 @@ int main(int argc,char** argv) {
   SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,[](HWINEVENTHOOK,DWORD,HWND,LONG,LONG,DWORD,DWORD){SetEvent(wakeEvent);},0,0,WINEVENT_OUTOFCONTEXT);
   SetWindowsHookExW(WH_MOUSE_LL,mouseEvent,GetModuleHandleW(nullptr),0);
   SetWindowsHookExW(WH_KEYBOARD_LL,keyEvent,GetModuleHandleW(nullptr),0);
+  std::cout<<"{\"kind\":\"status\",\"trusted\":true}"<<std::endl;
   std::string last;HWND previous=nullptr;
   for(;;) {
     std::string line="{\"kind\":\"clear\"}";
@@ -116,7 +119,7 @@ int main(int argc,char** argv) {
     if(dismissPending.exchange(false))std::cout<<"{\"kind\":\"dismiss\"}"<<std::endl;
     IUIAutomationElement* element=nullptr;
     const auto name=appName(pid);
-    if(enabled&&unlockedDesktop()&&pid!=parent&&!isExcluded(name)&&SUCCEEDED(automation->GetFocusedElement(&element))&&element) {
+    if(enabled&&!dragging&&GetTickCount64()>=selectionReadyAt&&unlockedDesktop()&&pid!=parent&&!isExcluded(name)&&SUCCEEDED(automation->GetFocusedElement(&element))&&element) {
       BOOL password=TRUE;element->get_CurrentIsPassword(&password);
       if(!password) {
         IUIAutomationTextPattern* pattern=nullptr;
@@ -141,7 +144,7 @@ int main(int argc,char** argv) {
                     SafeArrayDestroy(rectangles);
                   }
                   std::ostringstream output;
-                  output<<"{\"kind\":\"selection\",\"text\":"<<quoted(utf8(selected))<<",\"app\":"<<quoted(utf8(name))<<",\"x\":"<<x<<",\"y\":"<<y<<"}";
+                  output<<"{\"kind\":\"selection\",\"settled\":"<<(selectionSettled.exchange(false)?"true":"false")<<",\"text\":"<<quoted(utf8(selected))<<",\"app\":"<<quoted(utf8(name))<<",\"x\":"<<x<<",\"y\":"<<y<<"}";
                   line=output.str();
                 }
                 range->Release();
@@ -156,7 +159,8 @@ int main(int argc,char** argv) {
     }
     if(foreground!=previous) {std::cout<<"{\"kind\":\"clear\"}"<<std::endl;previous=foreground;}
     if(line!=last) {std::cout<<line<<std::endl;last=line;}
-    MsgWaitForMultipleObjects(1,&wakeEvent,FALSE,600,QS_ALLINPUT);
+    ULONGLONG now=GetTickCount64(),ready=selectionReadyAt;DWORD wait=ready>now?static_cast<DWORD>(std::min<ULONGLONG>(600,ready-now)):600;
+    MsgWaitForMultipleObjects(1,&wakeEvent,FALSE,wait,QS_ALLINPUT);
     MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
   }
 }

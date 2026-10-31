@@ -210,10 +210,14 @@ async fn translate_guarded(
     if !s.consent {
         return Err("Enable translation after reviewing the privacy notice.".into());
     }
+    let path = available_model(app)?;
+    run(app, &path, s, text, guard).await
+}
+fn available_model(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     #[cfg(debug_assertions)]
     if std::env::args().any(|a| a == "--qa-offline") {
         if let Ok(path) = std::env::var("CLARO_QA_MODEL") {
-            return run(app, &std::path::PathBuf::from(path), s, text, guard).await;
+            return Ok(path.into());
         }
     }
     if !licensed() {
@@ -226,8 +230,67 @@ async fn translate_guarded(
     if !path.join("model.bin").exists() {
         return Err("Download your offline model in Settings first.".into());
     }
-    run(app, &path, s, text, guard).await
+    Ok(path)
 }
+static POLICY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn configure(app: tauri::AppHandle, s: Settings) {
+    let epoch = POLICY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let keep = s.mode == "offline" && s.keep_model_warm;
+    KEEP_WARM.store(keep, std::sync::atomic::Ordering::SeqCst);
+    tauri::async_runtime::spawn(async move {
+        if POLICY_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+            return;
+        }
+        if s.mode != "offline" {
+            let mut slot = WORKER.lock().await;
+            if POLICY_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                slot.take();
+            }
+            return;
+        }
+        if keep {
+            if let Ok(path) = available_model(&app) {
+                let mut slot = WORKER.lock().await;
+                if slot.is_none() {
+                    if let Ok(worker) = start_worker(&app, &path).await {
+                        if POLICY_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                            *slot = Some(worker);
+                        }
+                    }
+                }
+            } else {
+                let mut slot = WORKER.lock().await;
+                if POLICY_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                    slot.take();
+                }
+            }
+        } else {
+            schedule_idle_unload();
+        }
+    });
+}
+fn should_unload(keep: bool, idle: std::time::Duration) -> bool {
+    !keep && idle >= std::time::Duration::from_secs(60)
+}
+fn schedule_idle_unload() {
+    tauri::async_runtime::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let mut slot = WORKER.lock().await;
+        if slot
+            .as_ref()
+            .map(|w| {
+                should_unload(
+                    KEEP_WARM.load(std::sync::atomic::Ordering::SeqCst),
+                    w.last_used.elapsed(),
+                )
+            })
+            .unwrap_or(false)
+        {
+            slot.take();
+        }
+    });
+}
+
 fn language_code(name: &str) -> Option<&'static str> {
     Some(match name {
         "Spanish" => "es",
@@ -358,12 +421,53 @@ struct Worker {
     last_used: std::time::Instant,
     request: u64,
 }
+static KEEP_WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static WORKER: tokio::sync::Mutex<Option<Worker>> = tokio::sync::Mutex::const_new(None);
 fn current(guard: &RequestGuard) -> bool {
     guard
         .as_ref()
         .map(|(core, id)| core.tracker.lock().unwrap().is_current(*id))
         .unwrap_or(true)
+}
+async fn start_worker(app: &tauri::AppHandle, path: &std::path::Path) -> Result<Worker, String> {
+    use tokio::io::AsyncBufReadExt;
+    let runner = engine(app)?;
+    let mut command = tokio::process::Command::new(runner);
+    command
+        .arg("--server")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "Couldn't start the offline engine.")?;
+    let input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        output.read_line(&mut ready),
+    )
+    .await
+    .map_err(|_| "The offline model took too long to load.")?
+    .map_err(|_| "Couldn't load the offline model.")?;
+    let ready: serde_json::Value =
+        serde_json::from_str(&ready).map_err(|_| "The offline engine couldn't load this model.")?;
+    if ready["ready"] != true {
+        return Err("The offline engine couldn't load this model.".into());
+    }
+    Ok(Worker {
+        _child: child,
+        input,
+        output,
+        model: path.into(),
+        last_used: std::time::Instant::now(),
+        request: 0,
+    })
 }
 async fn run(
     app: &tauri::AppHandle,
@@ -398,30 +502,7 @@ async fn run(
         slot.take();
     }
     if slot.is_none() {
-        let runner = engine(app)?;
-        let mut command = tokio::process::Command::new(runner);
-        command
-            .arg("--server")
-            .arg(path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        command.creation_flags(0x08000000);
-        let mut child = command
-            .spawn()
-            .map_err(|_| "Couldn't start the offline engine.")?;
-        let input = child.stdin.take().unwrap();
-        let output = tokio::io::BufReader::new(child.stdout.take().unwrap());
-        *slot = Some(Worker {
-            _child: child,
-            input,
-            output,
-            model: path.into(),
-            last_used: std::time::Instant::now(),
-            request: 0,
-        });
+        *slot = Some(start_worker(app, path).await?);
     }
     let worker = slot.as_mut().unwrap();
     worker.request += 1;
@@ -469,17 +550,7 @@ async fn run(
     // Always drain the matching reply, even if this selection was superseded.
     slot.as_mut().unwrap().last_used = std::time::Instant::now();
     drop(slot);
-    tauri::async_runtime::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        let mut slot = WORKER.lock().await;
-        if slot
-            .as_ref()
-            .map(|w| w.last_used.elapsed() >= std::time::Duration::from_secs(60))
-            .unwrap_or(false)
-        {
-            slot.take();
-        }
-    });
+    schedule_idle_unload();
     if !current(&guard) {
         return Err("Selection changed.".into());
     }
@@ -533,5 +604,35 @@ mod tests {
             "es"
         );
         assert!(detected_code("x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    #[test]
+    fn warm_is_default_and_can_be_disabled() {
+        let settings = Settings::default();
+        assert!(settings.keep_model_warm);
+        let mut json = serde_json::to_value(&settings).unwrap();
+        json.as_object_mut().unwrap().remove("keepModelWarm");
+        assert!(
+            serde_json::from_value::<Settings>(json.clone())
+                .unwrap()
+                .keep_model_warm
+        );
+        json["keepModelWarm"] = serde_json::json!(false);
+        assert!(
+            !serde_json::from_value::<Settings>(json)
+                .unwrap()
+                .keep_model_warm
+        );
+    }
+    #[test]
+    fn warm_model_is_not_evicted_and_cold_mode_has_a_real_idle_bound() {
+        use std::time::Duration;
+        assert!(!should_unload(true, Duration::from_secs(3600)));
+        assert!(!should_unload(false, Duration::from_secs(59)));
+        assert!(should_unload(false, Duration::from_secs(60)));
     }
 }

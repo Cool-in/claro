@@ -25,8 +25,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/cache/restore@v4
+        id: native-cache
+        with:
+          path: |
+            build-cache/native/ctranslate2-source
+            build-cache/native/sentencepiece-source
+            build-cache/native/offline-native/ctranslate2
+            build-cache/native/offline-native/sentencepiece
+          key: native-${{ runner.os }}-${{ runner.arch }}-ct2-484-sp021-ninja-v1
       - name: Build native CPU offline engine
         run: python scripts/build-offline.py --cache build-cache/native --jobs 4
+      - uses: actions/cache/save@v4
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            build-cache/native/ctranslate2-source
+            build-cache/native/sentencepiece-source
+            build-cache/native/offline-native/ctranslate2
+            build-cache/native/offline-native/sentencepiece
+          key: native-${{ runner.os }}-${{ runner.arch }}-ct2-484-sp021-ninja-v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> ../build-cache/rust
       - run: npm ci
       - run: npm run build
       - run: npm test

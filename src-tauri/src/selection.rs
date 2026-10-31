@@ -4,6 +4,7 @@ pub struct SelectionTracker {
     generation: u64,
     current: String,
     dismissed: String,
+    pending: bool,
 }
 impl SelectionTracker {
     pub fn select(&mut self, app: &str, text: &str) -> Option<u64> {
@@ -12,19 +13,38 @@ impl SelectionTracker {
             return None;
         }
         self.current = identity;
+        self.pending = true;
         self.generation += 1;
         Some(self.generation)
     }
     pub fn dismiss(&mut self, remember: bool) {
         self.generation += 1;
+        self.pending = false;
         if remember {
             self.dismissed = self.current.clone();
         }
     }
     pub fn clear(&mut self) {
         self.generation += 1;
+        self.pending = false;
         self.current.clear();
         self.dismissed.clear();
+    }
+    pub fn settle(&mut self, app: &str, text: &str) -> Option<u64> {
+        if self.pending
+            && self.current == format!("{}\0{}", app, text)
+            && self.dismissed != self.current
+        {
+            self.generation += 1;
+            Some(self.generation)
+        } else {
+            None
+        }
+    }
+    pub fn started(&mut self, generation: u64) {
+        if self.generation == generation {
+            self.pending = false;
+        }
     }
     pub fn is_current(&self, generation: u64) -> bool {
         self.generation == generation
@@ -76,5 +96,21 @@ mod tests {
         assert!(s.select("editor", "hello").is_none());
         assert!(s.is_current(generation));
         assert!(s.select("browser", "hello").is_some());
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+    #[test]
+    fn mouse_up_accelerates_pending_request_once() {
+        let mut s = SelectionTracker::default();
+        let old = s.select("editor", "hello").unwrap();
+        let new = s.settle("editor", "hello").unwrap();
+        assert!(!s.is_current(old));
+        s.started(new);
+        assert!(s.settle("editor", "hello").is_none());
+        s.dismiss(true);
+        assert!(s.settle("editor", "hello").is_none());
     }
 }

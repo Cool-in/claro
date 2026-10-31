@@ -66,6 +66,9 @@ int main(int argc, char** argv) {
   try {
     if (argc==3 && std::string(argv[1])=="--server") {
       Engine engine(argv[2]);
+      // Prime decoder allocations before announcing readiness; no user text is involved.
+      engine.translate("Hello.","es","en");
+      std::cout<<"{\"ready\":true}"<<std::endl;
       std::string line;
       while (std::getline(std::cin,line)) {
         nlohmann::json response={{"id",0},{"code",0}};

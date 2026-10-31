@@ -11,6 +11,11 @@ pub struct Settings {
     pub mode: String,
     pub consent: bool,
     pub excluded_apps: Vec<String>,
+    #[serde(default = "warm_by_default")]
+    pub keep_model_warm: bool,
+}
+fn warm_by_default() -> bool {
+    true
 }
 fn automatic_source() -> String {
     "Auto".into()
@@ -25,6 +30,7 @@ impl Default for Settings {
             mode: "cloud".into(),
             consent: false,
             excluded_apps: vec![],
+            keep_model_warm: true,
         }
     }
 }

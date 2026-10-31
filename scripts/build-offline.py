@@ -21,15 +21,16 @@ sp=checkout('sentencepiece-source','https://github.com/google/sentencepiece.git'
 run(['git','submodule','update','--init','--recursive','third_party/spdlog','third_party/cpu_features','third_party/ruy'],ct2)
 build=cache/'offline-native'
 ct2build=build/'ctranslate2';spbuild=build/'sentencepiece';runnerbuild=build/'runner'
+generator=['-G','Ninja'] if windows and shutil.which('ninja') else []
 ct2args=['-DWITH_MKL=OFF','-DWITH_CUDA=OFF','-DWITH_CUDNN=OFF','-DWITH_RUY=ON','-DOPENMP_RUNTIME=NONE','-DBUILD_CLI=OFF','-DBUILD_TESTS=OFF','-DBUILD_SHARED_LIBS=ON']
 if not windows:ct2args+=['-DWITH_ACCELERATE=ON','-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0']
-run(['cmake','-S',ct2,'-B',ct2build,'-DCMAKE_BUILD_TYPE=Release','-DCMAKE_POLICY_VERSION_MINIMUM=3.5',*ct2args])
+run(['cmake','-S',ct2,'-B',ct2build,*generator,'-DCMAKE_BUILD_TYPE=Release','-DCMAKE_POLICY_VERSION_MINIMUM=3.5',*ct2args])
 run(['cmake','--build',ct2build,'--config','Release','--parallel',args.jobs])
-run(['cmake','-S',sp,'-B',spbuild,'-DCMAKE_BUILD_TYPE=Release','-DCMAKE_POLICY_VERSION_MINIMUM=3.5','-DSPM_ENABLE_SHARED=OFF','-DSPM_BUILD_TEST=OFF','-DSPM_ENABLE_NFKC_COMPILE=OFF'])
+run(['cmake','-S',sp,'-B',spbuild,*generator,'-DCMAKE_BUILD_TYPE=Release','-DCMAKE_POLICY_VERSION_MINIMUM=3.5','-DSPM_ENABLE_SHARED=OFF','-DSPM_BUILD_TEST=OFF','-DSPM_ENABLE_NFKC_COMPILE=OFF'])
 run(['cmake','--build',spbuild,'--config','Release','--parallel',args.jobs,'--target','sentencepiece-static'])
 ct2lib=next(ct2build.rglob('ctranslate2.lib' if windows else 'libctranslate2.dylib'))
 splib=next(spbuild.rglob('sentencepiece.lib' if windows else 'libsentencepiece.a'))
-run(['cmake','-S',repo/'offline','-B',runnerbuild,'-DCMAKE_BUILD_TYPE=Release',f'-DCTRANSLATE2_INCLUDE={ct2}/include',f'-DCTRANSLATE2_LIBRARY={ct2lib}',f'-DSENTENCEPIECE_INCLUDE={sp}/src',f'-DSENTENCEPIECE_LIBRARY={splib}'])
+run(['cmake','-S',repo/'offline','-B',runnerbuild,*generator,'-DCMAKE_BUILD_TYPE=Release',f'-DCTRANSLATE2_INCLUDE={ct2}/include',f'-DCTRANSLATE2_LIBRARY={ct2lib}',f'-DSENTENCEPIECE_INCLUDE={sp}/src',f'-DSENTENCEPIECE_LIBRARY={splib}'])
 run(['cmake','--build',runnerbuild,'--config','Release','--parallel',args.jobs])
 executable=next(runnerbuild.rglob('claro-offline.exe' if windows else 'claro-offline'))
 if executable.parent!=runnerbuild:shutil.copy2(executable,runnerbuild/executable.name)
