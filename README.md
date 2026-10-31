@@ -59,14 +59,15 @@ ct2-transformers-converter --model facebook/m2m100_418M \
   --quantization int8 \
   --copy_files sentencepiece.bpe.model tokenizer_config.json vocab.json special_tokens_map.json
 python3 scripts/model-manifest.py /stable/Claro/offline-model/m2m100-int8 \
-  --base-url https://YOUR-APPROVED-MODEL-DISTRIBUTION-URL
+  --base-url https://github.com/Cool-in/claro-downloads/releases/download/model-m2m100-int8-v1 \
+  --expect offline/model.manifest.reference.json
 ```
 
-Check the converter's current `--help` before use; the exact pinned source revision must be selected. `offline/model.manifest.reference.json` contains the verified local file checksums and explicitly nonfunctional placeholder URLs. It is a reference, not an enabled download manifest.
+Check the converter's current `--help` before use; the exact pinned source revision must be selected. `offline/model.manifest.reference.json` pins the four verified runtime files and approved public HTTPS URLs. The same manifest is enabled in `src-tauri/release.json`. `--expect` prevents generating a release manifest from files that differ from the reviewed sizes and hashes; `--output PATH` atomically saves its JSON. Model weights stay out of the source repository. The public model release also includes the Meta MIT notice and conversion provenance.
 
-The public Polar organization ID, license-key benefit ID and checkout URL are populated in `src-tauri/release.json`. The configured product is $10 one-time with no expiry, activation limit or usage quota. Before enabling purchase/download, provide the approved pinned model download manifest and finish live Polar account activation. A single license must work on Mac and Windows; device activations are not required by this client. Keep all organization tokens and signing secrets outside the repository.
+The public Polar organization ID, license-key benefit ID and checkout URL are populated in `src-tauri/release.json`. The configured product is $10 one-time with no expiry, activation limit or usage quota. The pinned model download manifest is configured. Finish live Polar account activation before accepting paid orders. A single license must work on Mac and Windows; device activations are not required by this client. Keep all organization tokens and signing secrets outside the repository.
 
-The private/unlisted Polar product exists, but its checkout currently reports test mode and payments unavailable. The model download manifest is still null. Both frontend and backend purchase entry points stay gated until the model is configured; real checkout, license activation and model delivery are not yet verified. No fake purchase or license is created. Automatic cloud translation also requires the user's own provider key.
+The private/unlisted Polar product exists, but checkout currently reports test mode and paid payments unavailable. Real customer license fulfillment and activation still require end-to-end verification. The downloader has passed a complete anonymous public HTTPS install with hashes and atomic activation, plus local interrupted-transfer/resume, ignored-Range and corruption checks. No fake purchase or license is created. Automatic cloud translation also requires the user's own provider key.
 
 ## Performance and verification
 
@@ -77,3 +78,5 @@ Ambiguous short offline inputs request a source-language override. Paragraphs ov
 Debug-only flags `--preview-popup`, `--qa-diagnostics` and `--qa-offline` exist for visual/runtime QA. Preview text is a synthetic fixture. `--qa-offline` additionally requires `CLARO_QA_MODEL` pointing to an already converted local model and bypasses entitlement only in debug builds. `--qa-diagnostics` writes only current counters/timestamps, first current-request selection-to-ready render duration, offline queue/inference timings and state flags to the app cache, with no text, translation, key or app identifiers. Release builds contain no entitlement bypass or diagnostic-file writes. `--background` starts only the tray and selection reader, useful for login launch and idle measurements.
 
 Sources: [Tauri](https://v2.tauri.app/), [M2M100](https://huggingface.co/facebook/m2m100_418M), [CTranslate2](https://opennmt.net/CTranslate2/guides/transformers.html), [Polar license validation](https://polar.sh/docs/api-reference/2026-10/customer_portal/validate-license-key). Third-party runtime licenses are in `offline/licenses`.
+
+The default serial Rust suite uses tiny local HTTP fixtures for model downloads. To explicitly repeat the reviewed 473 MiB public download acceptance test, run `cargo test --manifest-path src-tauri/Cargo.toml published_model_download_uses_real_install_path -- --ignored --test-threads=1` with the documented stable build-cache environment. It uses the app downloader and removes its own temporary model fixture afterward. It is excluded from routine CI to avoid downloading the model on every build.

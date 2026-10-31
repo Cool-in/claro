@@ -57,21 +57,15 @@ pub async fn download(app: &tauri::AppHandle, _client: &reqwest::Client) -> Resu
     let model = license::release()
         .model
         .ok_or("The release model package is not configured yet.")?;
-    validate_manifest(&model)?;
-    let root = model_dir(app);
-    std::fs::create_dir_all(&root).map_err(|_| "Couldn't create the model folder.")?;
-    let free = fs2::available_space(&root).map_err(|_| "Couldn't check disk space.")?;
-    if free < model.bytes + 1024 * 1024 * 1024 {
-        return Err("There isn't enough disk space for this model. Keep at least 1 GB free after installation.".into());
-    }
-    let target = root.join(&model.id);
-    if target.exists() {
-        return Err("This model is already installed.".into());
-    }
-    let staging = root.join(format!("{}.partial", model.id));
-    std::fs::create_dir_all(&staging).map_err(|_| "Couldn't prepare the download.")?;
+    let client = download_client()?;
+    install_model(&client, &model, &model_dir(app), |percent| {
+        let _ = app.emit("download-progress", serde_json::json!({"percent":percent}));
+    })
+    .await
+}
+fn download_client() -> Result<reqwest::Client, String> {
     // This client carries no authorization. Model hosts may redirect to HTTPS CDNs.
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
@@ -83,13 +77,41 @@ pub async fn download(app: &tauri::AppHandle, _client: &reqwest::Client) -> Resu
             }
         }))
         .build()
-        .map_err(|_| "Couldn't prepare the download connection.")?;
+        .map_err(|_| "Couldn't prepare the download connection.".into())
+}
+fn download_url(value: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(value).map_err(|_| "Invalid model URL.")?;
+    if url.scheme() == "https" && url.username().is_empty() && url.password().is_none() {
+        return Ok(url);
+    }
+    // Local HTTP fixtures exist only in the test binary. Shipping downloads require HTTPS.
+    #[cfg(test)]
+    if url.scheme() == "http" && url.host_str() == Some("127.0.0.1") {
+        return Ok(url);
+    }
+    Err("Model downloads require HTTPS without embedded credentials.".into())
+}
+async fn install_model(
+    client: &reqwest::Client,
+    model: &license::Model,
+    root: &std::path::Path,
+    progress: impl Fn(f64),
+) -> Result<(), String> {
+    validate_manifest(model)?;
+    std::fs::create_dir_all(&root).map_err(|_| "Couldn't create the model folder.")?;
+    let free = fs2::available_space(root).map_err(|_| "Couldn't check disk space.")?;
+    if free < model.bytes + 1024 * 1024 * 1024 {
+        return Err("There isn't enough disk space for this model. Keep at least 1 GB free after installation.".into());
+    }
+    let target = root.join(&model.id);
+    if target.exists() {
+        return Err("This model is already installed.".into());
+    }
+    let staging = root.join(format!("{}.partial", model.id));
+    std::fs::create_dir_all(&staging).map_err(|_| "Couldn't prepare the download.")?;
     let mut total = 0u64;
     for file in &model.files {
-        let url = url::Url::parse(&file.url).map_err(|_| "Invalid model URL.")?;
-        if url.scheme() != "https" {
-            return Err("Model downloads require HTTPS.".into());
-        }
+        let url = download_url(&file.url)?;
         let path = staging.join(&file.name);
         let existing = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let mut hash = Sha256::new();
@@ -132,12 +154,12 @@ pub async fn download(app: &tauri::AppHandle, _client: &reqwest::Client) -> Resu
             return Err("The model download server returned an error. Retry to resume it.".into());
         }
         if bytes > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            let expected = format!("bytes {}-", bytes);
+            let expected = format!("bytes {}-{}/{}", bytes, file.bytes - 1, file.bytes);
             let valid = response
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|h| h.to_str().ok())
-                .map(|v| v.starts_with(&expected))
+                .map(|v| v == expected)
                 .unwrap_or(false);
             if !valid {
                 return Err("The download server returned an invalid resume range.".into());
@@ -171,15 +193,15 @@ pub async fn download(app: &tauri::AppHandle, _client: &reqwest::Client) -> Resu
                 .await
                 .map_err(|_| "Couldn't save the downloaded model.")?;
             total += chunk.len() as u64;
-            let _ = app.emit(
-                "download-progress",
-                serde_json::json!({"percent":(total as f64/model.bytes as f64*100.0).min(100.0)}),
-            );
+            progress((total as f64 / model.bytes as f64 * 100.0).min(100.0));
         }
         out.sync_all()
             .await
             .map_err(|_| "Couldn't finish writing the model.")?;
-        if bytes != file.bytes || hex::encode(hash.finalize()) != file.sha256.to_lowercase() {
+        if bytes != file.bytes {
+            return Err("Model download interrupted. Retry to resume it.".into());
+        }
+        if hex::encode(hash.finalize()) != file.sha256.to_lowercase() {
             let _ = std::fs::remove_file(path);
             return Err("The model couldn't be verified. Retry to download a clean copy.".into());
         }
@@ -651,5 +673,186 @@ mod policy_tests {
         assert!(!should_unload(true, Duration::from_secs(3600)));
         assert!(!should_unload(false, Duration::from_secs(59)));
         assert!(should_unload(false, Duration::from_secs(60)));
+    }
+}
+
+#[cfg(test)]
+mod download_integration_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::var_os("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("download-fixtures")
+                .join(name);
+            if root.exists() {
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn server(
+        status: u16,
+        headers: &str,
+        body: &[u8],
+        length: usize,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model.bin", listener.local_addr().unwrap());
+        let body = body.to_vec();
+        let headers = headers.to_string();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+                status, length, headers
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+            // Allow the client to consume the first chunk before a deliberately short body closes.
+            if length > body.len() {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            String::from_utf8(request).unwrap()
+        });
+        (url, thread)
+    }
+    fn model(url: String) -> license::Model {
+        let data = b"hello world";
+        license::Model {
+            id: "fixture".into(),
+            bytes: data.len() as u64,
+            files: vec![license::ModelFile {
+                name: "model.bin".into(),
+                url,
+                bytes: data.len() as u64,
+                sha256: hex::encode(Sha256::digest(data)),
+            }],
+        }
+    }
+    fn seed(root: &Fixture) {
+        std::fs::create_dir_all(root.0.join("fixture.partial")).unwrap();
+        std::fs::write(root.0.join("fixture.partial/model.bin"), b"hello ").unwrap();
+    }
+    #[test]
+    fn interrupted_download_resumes_with_range_and_installs_atomically() {
+        let root = Fixture::new("resume");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let client = download_client().unwrap();
+        let (url, first) = server(200, "", b"hello ", 11);
+        assert!(runtime
+            .block_on(install_model(&client, &model(url), &root.0, |_| {}))
+            .is_err());
+        first.join().unwrap();
+        assert!(!root.0.join("fixture").exists());
+        assert_eq!(
+            std::fs::read(root.0.join("fixture.partial/model.bin")).unwrap(),
+            b"hello "
+        );
+        let (url, second) = server(206, "Content-Range: bytes 6-10/11\r\n", b"world", 5);
+        runtime
+            .block_on(install_model(&client, &model(url), &root.0, |_| {}))
+            .unwrap();
+        let request = second.join().unwrap().to_lowercase();
+        assert!(request.contains("range: bytes=6-"));
+        assert!(!request.contains("authorization:"));
+        assert_eq!(
+            std::fs::read(root.0.join("fixture/model.bin")).unwrap(),
+            b"hello world"
+        );
+        assert!(!root.0.join("fixture.partial").exists());
+    }
+    #[test]
+    fn server_ignoring_range_restarts_without_duplicate_bytes() {
+        let root = Fixture::new("restart");
+        seed(&root);
+        let (url, server) = server(200, "", b"hello world", 11);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(install_model(
+                &download_client().unwrap(),
+                &model(url),
+                &root.0,
+                |_| {},
+            ))
+            .unwrap();
+        assert!(server
+            .join()
+            .unwrap()
+            .to_lowercase()
+            .contains("range: bytes=6-"));
+        assert_eq!(
+            std::fs::read(root.0.join("fixture/model.bin")).unwrap(),
+            b"hello world"
+        );
+    }
+    #[test]
+    fn bad_range_and_corruption_never_install_a_model() {
+        let root = Fixture::new("integrity");
+        seed(&root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let client = download_client().unwrap();
+        let (url, first) = server(206, "Content-Range: bytes 6-10/999\r\n", b"world", 5);
+        assert!(runtime
+            .block_on(install_model(&client, &model(url), &root.0, |_| {}))
+            .unwrap_err()
+            .contains("range"));
+        first.join().unwrap();
+        assert!(!root.0.join("fixture").exists());
+        let (url, second) = server(200, "", b"wrong bytes", 11);
+        assert!(runtime
+            .block_on(install_model(&client, &model(url), &root.0, |_| {}))
+            .unwrap_err()
+            .contains("verified"));
+        second.join().unwrap();
+        assert!(!root.0.join("fixture").exists());
+        assert!(!root.0.join("fixture.partial/model.bin").exists());
+    }
+    #[test]
+    #[ignore = "Explicit network acceptance check for the reviewed 473 MiB public model"]
+    fn published_model_download_uses_real_install_path() {
+        let root = Fixture::new("published-model");
+        let model = license::release()
+            .model
+            .expect("Published model manifest required");
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(install_model(
+                &download_client().unwrap(),
+                &model,
+                &root.0,
+                |_| {
+                    progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            ))
+            .unwrap();
+        assert!(progress.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(!root.0.join(format!("{}.partial", model.id)).exists());
+        for file in model.files {
+            assert_eq!(
+                std::fs::metadata(root.0.join(&model.id).join(file.name))
+                    .unwrap()
+                    .len(),
+                file.bytes
+            );
+        }
     }
 }
