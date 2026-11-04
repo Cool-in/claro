@@ -77,3 +77,6 @@ html:not(.popup-root) #notice.error{background:#32241f;color:#e7b39d}
 html:not(.popup-root) .status-dot{background:#7fc2a8}
 html:not(.popup-root) .status-dot.paused{background:#8a8775}
 }
+
+.hint{font-weight:400;font-size:9.5px;color:#66767e;margin-left:5px}
+.field select{width:100%;max-width:none;height:32px}

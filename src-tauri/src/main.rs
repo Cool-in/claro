@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod cache;
 mod license;
 mod offline;
 mod provider;
@@ -50,6 +51,7 @@ struct Core {
     popup_epoch: AtomicU64,
     cloud_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     status_error: Mutex<Option<String>>,
+    cache: cache::TranslationCache,
     #[cfg(debug_assertions)]
     diagnostics: Mutex<Value>,
 }
@@ -166,6 +168,9 @@ fn save_settings(
     if settings.model.trim().is_empty() || settings.model.len() > 200 {
         return Err("Enter a provider model name.".into());
     }
+    if !["Neutral", "Formal", "Casual"].contains(&settings.tone.as_str()) {
+        return Err("Choose a supported tone.".into());
+    }
     if !["cloud", "offline"].contains(&settings.mode.as_str()) {
         return Err("Choose cloud or offline translation.".into());
     }
@@ -202,6 +207,7 @@ fn save_settings(
     persist_settings(&app, &settings)?;
     *core.settings.lock().unwrap() = settings.clone();
     offline::configure(app.clone(), settings);
+    warm_provider(&core);
     control(&core);
     core.tracker.lock().unwrap().clear();
     dismiss(&app, &core, false);
@@ -599,7 +605,12 @@ async fn translate_manual(
     if s.mode == "offline" {
         return offline::translate(&app, &s, &text).await;
     }
-    provider::translate(&core.client, &s, &key_for(&s)?, &text).await
+    if let Some(hit) = core.cache.get(&s, &text) {
+        return Ok(hit);
+    }
+    let fresh = provider::translate(&core.client, &s, &key_for(&s)?, &text).await?;
+    core.cache.put(&s, &text, &fresh);
+    Ok(fresh)
 }
 #[tauri::command]
 async fn activate_license(
@@ -907,6 +918,16 @@ fn capture(app: tauri::AppHandle, core: Arc<Core>) {
         }
     });
 }
+fn warm_provider(core: &Arc<Core>) {
+    let s = core.settings.lock().unwrap().clone();
+    if s.mode != "cloud" || !s.consent || key_for(&s).is_err() {
+        return;
+    }
+    let client = core.client.clone();
+    tauri::async_runtime::spawn(async move {
+        provider::warm(&client, &s).await;
+    });
+}
 fn spawn_translation(
     app: tauri::AppHandle,
     core: Arc<Core>,
@@ -939,6 +960,8 @@ fn spawn_translation(
         let result = if settings.mode == "offline" {
             offline::translate_auto(&app, &settings, &selection.text, core.clone(), generation)
                 .await
+        } else if let Some(hit) = core.cache.get(&settings, &selection.text) {
+            Ok(hit)
         } else {
             match key_for(&settings) {
                 Ok(k) => {
@@ -957,14 +980,18 @@ fn spawn_translation(
                             json!({"state":"streaming","text":partial,"target":target,"mode":mode}),
                         );
                     };
-                    provider::translate_stream(
+                    let fresh = provider::translate_stream(
                         &core.client,
                         &settings,
                         &k,
                         &selection.text,
                         &mut on_partial,
                     )
-                    .await
+                    .await;
+                    if let Ok(text) = &fresh {
+                        core.cache.put(&settings, &selection.text, text);
+                    }
+                    fresh
                 }
                 Err(e) => Err(e),
             }
@@ -1285,6 +1312,7 @@ fn main() {
         popup_epoch: AtomicU64::new(0),
         cloud_task: Mutex::new(None),
         status_error: Mutex::new(None),
+        cache: cache::TranslationCache::default(),
         #[cfg(debug_assertions)]
         diagnostics: Mutex::new(json!({})),
     });
@@ -1370,6 +1398,7 @@ fn main() {
             let handle = app.handle().clone();
             let refresh_core=core.clone();let refresh_app=handle.clone();tauri::async_runtime::spawn(async move { license::refresh(&refresh_core.client).await; offline::configure(refresh_app.clone(),refresh_core.settings.lock().unwrap().clone()); let _=refresh_app.emit("state-changed",()); });
             offline::configure(handle.clone(),core.settings.lock().unwrap().clone());
+            warm_provider(&core);
             capture(handle.clone(), core.clone());
             if core.settings.lock().unwrap().consent { let _ = ensure_popup(&handle, &core); }
             if !std::env::args().any(|a|a=="--background"){settings(&handle,false);}

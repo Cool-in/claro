@@ -14,6 +14,8 @@ Free download with your own OpenAI or OpenAI-compatible API key. A planned €10
 - A compiled, CPU-only CTranslate2/SentencePiece offline worker. It prewarms and keeps the unlocked/downloaded model ready by default in offline mode, serializes requests and matches response IDs. A memory-saving preference unloads it after 60 idle seconds; switching to API mode releases it. End users do not need Python.
 - Explicit resumable model download, pinned SHA-256 and byte-size checks, disk-space checks and atomic installation. No automatic cloud fallback.
 - Polar's public customer license validation API, expected organization/benefit checks and a secure cached entitlement. Network failure preserves a previously verified lifetime license; a definitive invalid/revoked response removes it. No organization token is bundled.
+- Cloud speed: tokens stream into the popup as they arrive, the provider connection is opened ahead of the first selection, and the last 48 translations are remembered in memory only (hashed keys, never written to disk, gone on quit) so re-selecting text is instant.
+- Cloud options: a Neutral, Formal or Casual tone, and one-click provider presets (OpenAI, Groq, OpenRouter, Ollama). Preset model names are suggestions you can edit.
 - Launch at login is optional and off by default.
 
 ## Local development
