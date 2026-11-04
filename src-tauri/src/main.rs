@@ -150,7 +150,7 @@ fn get_state(app: tauri::AppHandle, core: State<Arc<Core>>) -> Value {
     let r = license::release();
     let settings = core.settings.lock().unwrap().clone();
     let has_key = key_for(&settings).is_ok();
-    json!({"settings":settings,"hasKey":has_key,"licensed":licensed(),"paused":core.paused.load(Ordering::SeqCst),"permission":core.permission.load(Ordering::SeqCst),"checkoutAvailable":!r.checkout_url.is_empty()&&r.model.is_some(),"modelAvailable":r.model.is_some(),"launchAtLogin":app.autolaunch().is_enabled().unwrap_or(false),"statusError":core.status_error.lock().unwrap().clone()})
+    json!({"settings":settings,"hasKey":has_key,"licensed":licensed(),"paused":core.paused.load(Ordering::SeqCst),"permission":core.permission.load(Ordering::SeqCst),"checkoutAvailable":!r.checkout_url.is_empty()&&r.model.is_some(),"modelAvailable":r.model.is_some(),"priceLabel":r.price_label,"launchAtLogin":app.autolaunch().is_enabled().unwrap_or(false),"statusError":core.status_error.lock().unwrap().clone()})
 }
 #[tauri::command]
 fn save_settings(
@@ -941,7 +941,31 @@ fn spawn_translation(
                 .await
         } else {
             match key_for(&settings) {
-                Ok(k) => provider::translate(&core.client, &settings, &k, &selection.text).await,
+                Ok(k) => {
+                    let mut last: Option<std::time::Instant> = None;
+                    let (stream_app, stream_core) = (app.clone(), core.clone());
+                    let (target, mode) = (settings.target.clone(), settings.mode.clone());
+                    let mut on_partial = move |partial: &str| {
+                        if last.map_or(false, |t| t.elapsed() < Duration::from_millis(60)) {
+                            return;
+                        }
+                        last = Some(std::time::Instant::now());
+                        emit_current(
+                            &stream_app,
+                            &stream_core,
+                            generation,
+                            json!({"state":"streaming","text":partial,"target":target,"mode":mode}),
+                        );
+                    };
+                    provider::translate_stream(
+                        &core.client,
+                        &settings,
+                        &k,
+                        &selection.text,
+                        &mut on_partial,
+                    )
+                    .await
+                }
                 Err(e) => Err(e),
             }
         };
@@ -1240,6 +1264,9 @@ fn main() {
         settings: Mutex::new(initial),
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(35))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(300))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
@@ -1390,7 +1417,15 @@ fn main() {
 #[cfg(test)]
 mod test_http {
     pub fn server(status: u16, body: &str) -> (String, std::sync::mpsc::Receiver<String>) {
+        server_typed(status, "application/json", body)
+    }
+    pub fn server_typed(
+        status: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
+        let content_type = content_type.to_owned();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let body = body.to_owned();
@@ -1423,7 +1458,7 @@ mod test_http {
                 }
             }
             let _ = tx.send(String::from_utf8_lossy(&data).to_string());
-            write!(stream,"HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",status,body.len(),body).unwrap();
+            write!(stream,"HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",status,content_type,body.len(),body).unwrap();
         });
         (url, rx)
     }
