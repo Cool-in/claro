@@ -2,6 +2,7 @@
   "polarOrganizationId": "065f154c-48ab-43fb-8ec2-d15b4e6fc753",
   "polarBenefitId": "ff9e3867-0943-4e1f-9dcb-059cfb5cee08",
   "checkoutUrl": "https://buy.polar.sh/polar_cl_l1g5nvqcLrMGlyjIzfLVnCDr8gVXx3fdZdQH234ytlo",
+  "priceLabel": "€10",
   "model": {
     "id": "m2m100-418m-int8-v1",
     "bytes": 495887877,

@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod cache;
 mod license;
 mod offline;
 mod provider;
@@ -50,6 +51,7 @@ struct Core {
     popup_epoch: AtomicU64,
     cloud_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     status_error: Mutex<Option<String>>,
+    cache: cache::TranslationCache,
     #[cfg(debug_assertions)]
     diagnostics: Mutex<Value>,
 }
@@ -150,7 +152,7 @@ fn get_state(app: tauri::AppHandle, core: State<Arc<Core>>) -> Value {
     let r = license::release();
     let settings = core.settings.lock().unwrap().clone();
     let has_key = key_for(&settings).is_ok();
-    json!({"settings":settings,"hasKey":has_key,"licensed":licensed(),"paused":core.paused.load(Ordering::SeqCst),"permission":core.permission.load(Ordering::SeqCst),"checkoutAvailable":!r.checkout_url.is_empty()&&r.model.is_some(),"modelAvailable":r.model.is_some(),"launchAtLogin":app.autolaunch().is_enabled().unwrap_or(false),"statusError":core.status_error.lock().unwrap().clone()})
+    json!({"settings":settings,"hasKey":has_key,"licensed":licensed(),"paused":core.paused.load(Ordering::SeqCst),"permission":core.permission.load(Ordering::SeqCst),"checkoutAvailable":!r.checkout_url.is_empty()&&r.model.is_some(),"modelAvailable":r.model.is_some(),"priceLabel":r.price_label,"launchAtLogin":app.autolaunch().is_enabled().unwrap_or(false),"statusError":core.status_error.lock().unwrap().clone()})
 }
 #[tauri::command]
 fn save_settings(
@@ -165,6 +167,9 @@ fn save_settings(
     }
     if settings.model.trim().is_empty() || settings.model.len() > 200 {
         return Err("Enter a provider model name.".into());
+    }
+    if !["Neutral", "Formal", "Casual"].contains(&settings.tone.as_str()) {
+        return Err("Choose a supported tone.".into());
     }
     if !["cloud", "offline"].contains(&settings.mode.as_str()) {
         return Err("Choose cloud or offline translation.".into());
@@ -202,6 +207,7 @@ fn save_settings(
     persist_settings(&app, &settings)?;
     *core.settings.lock().unwrap() = settings.clone();
     offline::configure(app.clone(), settings);
+    warm_provider(&core);
     control(&core);
     core.tracker.lock().unwrap().clear();
     dismiss(&app, &core, false);
@@ -599,7 +605,12 @@ async fn translate_manual(
     if s.mode == "offline" {
         return offline::translate(&app, &s, &text).await;
     }
-    provider::translate(&core.client, &s, &key_for(&s)?, &text).await
+    if let Some(hit) = core.cache.get(&s, &text) {
+        return Ok(hit);
+    }
+    let fresh = provider::translate(&core.client, &s, &key_for(&s)?, &text).await?;
+    core.cache.put(&s, &text, &fresh);
+    Ok(fresh)
 }
 #[tauri::command]
 async fn activate_license(
@@ -907,6 +918,16 @@ fn capture(app: tauri::AppHandle, core: Arc<Core>) {
         }
     });
 }
+fn warm_provider(core: &Arc<Core>) {
+    let s = core.settings.lock().unwrap().clone();
+    if s.mode != "cloud" || !s.consent || key_for(&s).is_err() {
+        return;
+    }
+    let client = core.client.clone();
+    tauri::async_runtime::spawn(async move {
+        provider::warm(&client, &s).await;
+    });
+}
 fn spawn_translation(
     app: tauri::AppHandle,
     core: Arc<Core>,
@@ -939,9 +960,39 @@ fn spawn_translation(
         let result = if settings.mode == "offline" {
             offline::translate_auto(&app, &settings, &selection.text, core.clone(), generation)
                 .await
+        } else if let Some(hit) = core.cache.get(&settings, &selection.text) {
+            Ok(hit)
         } else {
             match key_for(&settings) {
-                Ok(k) => provider::translate(&core.client, &settings, &k, &selection.text).await,
+                Ok(k) => {
+                    let mut last: Option<std::time::Instant> = None;
+                    let (stream_app, stream_core) = (app.clone(), core.clone());
+                    let (target, mode) = (settings.target.clone(), settings.mode.clone());
+                    let mut on_partial = move |partial: &str| {
+                        if last.map_or(false, |t| t.elapsed() < Duration::from_millis(60)) {
+                            return;
+                        }
+                        last = Some(std::time::Instant::now());
+                        emit_current(
+                            &stream_app,
+                            &stream_core,
+                            generation,
+                            json!({"state":"streaming","text":partial,"target":target,"mode":mode}),
+                        );
+                    };
+                    let fresh = provider::translate_stream(
+                        &core.client,
+                        &settings,
+                        &k,
+                        &selection.text,
+                        &mut on_partial,
+                    )
+                    .await;
+                    if let Ok(text) = &fresh {
+                        core.cache.put(&settings, &selection.text, text);
+                    }
+                    fresh
+                }
                 Err(e) => Err(e),
             }
         };
@@ -1240,6 +1291,9 @@ fn main() {
         settings: Mutex::new(initial),
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(35))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(300))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
@@ -1258,6 +1312,7 @@ fn main() {
         popup_epoch: AtomicU64::new(0),
         cloud_task: Mutex::new(None),
         status_error: Mutex::new(None),
+        cache: cache::TranslationCache::default(),
         #[cfg(debug_assertions)]
         diagnostics: Mutex::new(json!({})),
     });
@@ -1343,6 +1398,7 @@ fn main() {
             let handle = app.handle().clone();
             let refresh_core=core.clone();let refresh_app=handle.clone();tauri::async_runtime::spawn(async move { license::refresh(&refresh_core.client).await; offline::configure(refresh_app.clone(),refresh_core.settings.lock().unwrap().clone()); let _=refresh_app.emit("state-changed",()); });
             offline::configure(handle.clone(),core.settings.lock().unwrap().clone());
+            warm_provider(&core);
             capture(handle.clone(), core.clone());
             if core.settings.lock().unwrap().consent { let _ = ensure_popup(&handle, &core); }
             if !std::env::args().any(|a|a=="--background"){settings(&handle,false);}
@@ -1390,7 +1446,15 @@ fn main() {
 #[cfg(test)]
 mod test_http {
     pub fn server(status: u16, body: &str) -> (String, std::sync::mpsc::Receiver<String>) {
+        server_typed(status, "application/json", body)
+    }
+    pub fn server_typed(
+        status: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
+        let content_type = content_type.to_owned();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let body = body.to_owned();
@@ -1423,7 +1487,7 @@ mod test_http {
                 }
             }
             let _ = tx.send(String::from_utf8_lossy(&data).to_string());
-            write!(stream,"HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",status,body.len(),body).unwrap();
+            write!(stream,"HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",status,content_type,body.len(),body).unwrap();
         });
         (url, rx)
     }

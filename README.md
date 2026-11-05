@@ -2,7 +2,7 @@
 
 A quiet desktop translator for macOS and Windows. Highlight text in another app and a small, nonactivating panel appears beside the selection. Spanish is the default target language. Source detection and a manual source override are available.
 
-Free download with your own OpenAI or OpenAI-compatible API key. A planned $10 lifetime Polar purchase unlocks an optional local translation model on both platforms. Source stays private in `Cool-in/claro`. Approved public binaries and models use the separate `Cool-in/claro-downloads` repository. The model release is https://github.com/Cool-in/claro-downloads/releases/tag/model-m2m100-int8-v1 . CI does not publish source or automatically create an installer release.
+Free download with your own OpenAI or OpenAI-compatible API key. A planned €10 lifetime Polar purchase unlocks an optional local translation model on both platforms. Source stays private in `Cool-in/claro`. Approved public binaries and models use the separate `Cool-in/claro-downloads` repository. The model release is https://github.com/Cool-in/claro-downloads/releases/tag/model-m2m100-int8-v1 . CI does not publish source or automatically create an installer release.
 
 ## What is implemented
 
@@ -14,6 +14,8 @@ Free download with your own OpenAI or OpenAI-compatible API key. A planned $10 l
 - A compiled, CPU-only CTranslate2/SentencePiece offline worker. It prewarms and keeps the unlocked/downloaded model ready by default in offline mode, serializes requests and matches response IDs. A memory-saving preference unloads it after 60 idle seconds; switching to API mode releases it. End users do not need Python.
 - Explicit resumable model download, pinned SHA-256 and byte-size checks, disk-space checks and atomic installation. No automatic cloud fallback.
 - Polar's public customer license validation API, expected organization/benefit checks and a secure cached entitlement. Network failure preserves a previously verified lifetime license; a definitive invalid/revoked response removes it. No organization token is bundled.
+- Cloud speed: tokens stream into the popup as they arrive, the provider connection is opened ahead of the first selection, and the last 48 translations are remembered in memory only (hashed keys, never written to disk, gone on quit) so re-selecting text is instant.
+- Cloud options: a Neutral, Formal or Casual tone, and one-click provider presets (OpenAI, Groq, OpenRouter, Ollama). Preset model names are suggestions you can edit.
 - Launch at login is optional and off by default.
 
 ## Local development
@@ -65,9 +67,9 @@ python3 scripts/model-manifest.py /stable/Claro/offline-model/m2m100-int8 \
 
 Check the converter's current `--help` before use; the exact pinned source revision must be selected. `offline/model.manifest.reference.json` pins the four verified runtime files and approved public HTTPS URLs. The same manifest is enabled in `src-tauri/release.json`. `--expect` prevents generating a release manifest from files that differ from the reviewed sizes and hashes; `--output PATH` atomically saves its JSON. Model weights stay out of the source repository. The public model release also includes the Meta MIT notice and conversion provenance.
 
-The public Polar organization ID, license-key benefit ID and checkout URL are populated in `src-tauri/release.json`. The configured product is $10 one-time with no expiry, activation limit or usage quota. The pinned model download manifest is configured. Finish live Polar account activation before accepting paid orders. A single license must work on Mac and Windows; device activations are not required by this client. Keep all organization tokens and signing secrets outside the repository.
+The public Polar organization ID, license-key benefit ID and checkout URL are populated in `src-tauri/release.json`. The configured product is one-time with no expiry, activation limit or usage quota. The pinned model download manifest is configured. Finish live Polar account activation before accepting paid orders. A single license must work on Mac and Windows; device activations are not required by this client. Keep all organization tokens and signing secrets outside the repository.
 
-The private/unlisted Polar product exists, but checkout currently reports test mode and paid payments unavailable. Real customer license fulfillment and activation still require end-to-end verification. The downloader has passed a complete anonymous public HTTPS install with hashes and atomic activation, plus local interrupted-transfer/resume, ignored-Range and corruption checks. No fake purchase or license is created. Automatic cloud translation also requires the user's own provider key.
+The private/unlisted Polar product exists (currently priced in USD; add a EUR price in Polar so checkout matches the in-app €10 label from `priceLabel` in `src-tauri/release.json`), but checkout currently reports test mode and paid payments unavailable. Real customer license fulfillment and activation still require end-to-end verification. The downloader has passed a complete anonymous public HTTPS install with hashes and atomic activation, plus local interrupted-transfer/resume, ignored-Range and corruption checks. No fake purchase or license is created. Automatic cloud translation also requires the user's own provider key.
 
 ## Performance and verification
 

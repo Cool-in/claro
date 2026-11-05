@@ -6,6 +6,8 @@ pub struct Release {
     pub polar_organization_id: String,
     pub polar_benefit_id: String,
     pub checkout_url: String,
+    #[serde(default)]
+    pub price_label: String,
     pub model: Option<Model>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -137,6 +139,7 @@ mod tests {
             polar_organization_id: "org".into(),
             polar_benefit_id: "benefit".into(),
             checkout_url: "".into(),
+            price_label: "".into(),
             model: None,
         };
         let good = json!({"organization_id":"org","benefit_id":"benefit","status":"granted","expires_at":null});
@@ -156,6 +159,7 @@ mod tests {
             polar_organization_id: "org".into(),
             polar_benefit_id: "benefit".into(),
             checkout_url: "".into(),
+            price_label: "".into(),
             model: None,
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
