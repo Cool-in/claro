@@ -122,9 +122,30 @@ fn key_for(s: &Settings) -> Result<String, String> {
         "provider-{}",
         hex::encode(Sha256::digest(s.base_url.trim_end_matches('/').as_bytes()))
     );
-    secret(&account)?
-        .get_password()
-        .map_err(|_| "Add your provider API key in Settings.".into())
+    cached_key(&account, || {
+        secret(&account)?
+            .get_password()
+            .map_err(|_| "Add your provider API key in Settings.".into())
+    })
+}
+// The Keychain is slow and can prompt, so the active provider's key is kept in
+// memory after the first read. It is cleared whenever a key is saved or removed.
+static KEY_CACHE: Mutex<Option<(String, String)>> = Mutex::new(None);
+fn cached_key(
+    account: &str,
+    load: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    if let Some((cached_account, key)) = KEY_CACHE.lock().unwrap().as_ref() {
+        if cached_account == account {
+            return Ok(key.clone());
+        }
+    }
+    let key = load()?;
+    *KEY_CACHE.lock().unwrap() = Some((account.to_string(), key.clone()));
+    Ok(key)
+}
+fn forget_cached_key() {
+    *KEY_CACHE.lock().unwrap() = None;
 }
 fn licensed() -> bool {
     license::cached().is_some()
@@ -202,6 +223,7 @@ fn save_settings(
             }
             .set_password(key.trim())
             .map_err(|_| "Couldn't save your key securely.")?;
+            forget_cached_key();
         }
     }
     persist_settings(&app, &settings)?;
@@ -542,6 +564,7 @@ fn remove_key(core: State<Arc<Core>>) -> Result<(), String> {
         "provider-{}",
         hex::encode(Sha256::digest(s.base_url.trim_end_matches('/').as_bytes()))
     );
+    forget_cached_key();
     match secret(&name)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(_) => Err("Couldn't remove the saved key.".into()),
@@ -1493,6 +1516,31 @@ mod test_http {
     }
 }
 
+#[cfg(test)]
+mod key_cache_tests {
+    use super::*;
+    #[test]
+    fn key_is_read_once_per_provider_and_cleared_on_change() {
+        forget_cached_key();
+        let reads = std::cell::Cell::new(0);
+        let load = |value: &'static str| {
+            let reads = &reads;
+            move || {
+                reads.set(reads.get() + 1);
+                Ok::<String, String>(value.to_string())
+            }
+        };
+        assert_eq!(cached_key("a", load("one")).unwrap(), "one");
+        assert_eq!(cached_key("a", load("two")).unwrap(), "one");
+        assert_eq!(reads.get(), 1);
+        assert_eq!(cached_key("b", load("three")).unwrap(), "three");
+        forget_cached_key();
+        assert_eq!(cached_key("b", load("four")).unwrap(), "four");
+        assert_eq!(reads.get(), 3);
+        forget_cached_key();
+        assert!(cached_key("c", || Err("missing".into())).is_err());
+    }
+}
 #[cfg(test)]
 mod popup_race_tests {
     use super::*;

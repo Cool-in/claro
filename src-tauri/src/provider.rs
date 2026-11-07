@@ -65,8 +65,8 @@ pub fn endpoint(base: &str) -> Result<String, String> {
     Ok(format!("{}/chat/completions", base.trim_end_matches('/')))
 }
 fn check_input(s: &Settings, text: &str) -> Result<(), String> {
-    if text.trim().is_empty() || text.len() > 12000 {
-        return Err("Select between 1 and 12,000 bytes of text.".into());
+    if text.trim().is_empty() || text.chars().count() > 12000 {
+        return Err("Select between 1 and 12,000 characters of text.".into());
     }
     if !s.consent {
         return Err("Enable translation after reviewing the privacy notice.".into());
@@ -417,5 +417,19 @@ mod tone_and_warm_tests {
         let request = rx.recv().unwrap().to_lowercase();
         assert!(request.starts_with("head "));
         assert!(!request.contains("authorization"));
+    }
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        let mut s = Settings::default();
+        s.consent = true;
+        // 5,000 Japanese characters are 15,000 bytes but well inside the 12,000 character limit.
+        assert!(check_input(&s, &"\u{3042}".repeat(5000)).is_ok());
+        assert!(check_input(&s, &"\u{3042}".repeat(12000)).is_ok());
+        assert!(check_input(&s, &"\u{3042}".repeat(12001)).unwrap_err().contains("12,000 characters"));
     }
 }

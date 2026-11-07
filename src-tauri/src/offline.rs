@@ -502,8 +502,8 @@ async fn run(
     guard: RequestGuard,
 ) -> Result<String, String> {
     use tokio::io::AsyncBufReadExt;
-    if text.trim().is_empty() || text.len() > 12000 {
-        return Err("Select between 1 and 12,000 bytes of text.".into());
+    if text.trim().is_empty() || text.chars().count() > 12000 {
+        return Err("Select between 1 and 12,000 characters of text.".into());
     }
     let target = language_code(&s.target).ok_or("Unsupported target language.")?;
     let source = if s.source_language == "Auto" {

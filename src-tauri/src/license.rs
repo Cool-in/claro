@@ -118,7 +118,9 @@ async fn validate_at(
                 "Polar could not validate this license (HTTP {}).",
                 status.as_u16()
             ),
-            revoked: matches!(status.as_u16(), 400 | 403 | 404),
+            // A 400 means our own request was wrong, not that the license is bad,
+            // so it must never wipe a paid license that was already verified.
+            revoked: matches!(status.as_u16(), 403 | 404),
         });
     }
     let body: Value = response.json().await.map_err(|_| ValidationError {
@@ -174,5 +176,23 @@ mod tests {
         assert!(request.to_lowercase().contains("polar-version: 2026-10"));
         assert!(request.contains("\"benefit_id\":\"benefit\""));
         assert!(!request.to_lowercase().contains("authorization:"));
+    }
+    #[test]
+    fn only_forbidden_or_missing_revokes_a_saved_license() {
+        let r = Release {
+            polar_organization_id: "org".into(),
+            polar_benefit_id: "benefit".into(),
+            checkout_url: "".into(),
+            price_label: "".into(),
+            model: None,
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (code, revoked) in [(400u16, false), (429, false), (500, false), (403, true), (404, true)] {
+            let (url, _rx) = crate::test_http::server(code, "{}");
+            let error = runtime
+                .block_on(validate_at(&reqwest::Client::new(), "test-only-license", &r, &url))
+                .unwrap_err();
+            assert_eq!(error.revoked, revoked, "status {code}");
+        }
     }
 }
