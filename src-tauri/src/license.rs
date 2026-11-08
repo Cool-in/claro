@@ -49,7 +49,21 @@ pub fn validate_identity(v: &Value, r: &Release) -> Result<(), String> {
     }
     Ok(())
 }
+// Only a successful read is remembered, so one failed Keychain read can never
+// lock a paying customer out. Cleared when the license is saved or removed.
+static LICENSE_CACHE: std::sync::Mutex<Option<Entitlement>> = std::sync::Mutex::new(None);
+fn forget_cached_license() {
+    *LICENSE_CACHE.lock().unwrap() = None;
+}
 pub fn cached() -> Option<Entitlement> {
+    if let Some(record) = LICENSE_CACHE.lock().unwrap().as_ref() {
+        return Some(record.clone());
+    }
+    let record = load_cached()?;
+    *LICENSE_CACHE.lock().unwrap() = Some(record.clone());
+    Some(record)
+}
+fn load_cached() -> Option<Entitlement> {
     let entry = crate::secret("license-v1").ok()?;
     let record: Entitlement = serde_json::from_str(&entry.get_password().ok()?).ok()?;
     let config = release();
@@ -72,6 +86,7 @@ pub fn save(key: &str) -> Result<(), String> {
             .unwrap_or_default()
             .as_secs(),
     };
+    forget_cached_license();
     crate::secret("license-v1")?
         .set_password(&serde_json::to_string(&record).unwrap())
         .map_err(|_| "Couldn't securely save the verified license.".into())
@@ -83,6 +98,7 @@ pub async fn refresh(client: &reqwest::Client) {
                 let _ = save(&record.key);
             }
             Err(error) if error.revoked => {
+                forget_cached_license();
                 if let Ok(entry) = crate::secret("license-v1") {
                     let _ = entry.delete_credential();
                 }
