@@ -56,3 +56,11 @@ Settings-drag handoff: PID 62803 remains running with Settings visible and the e
 
 - Beta published: https://github.com/Cool-in/claro-downloads/releases/tag/v0.1.0-beta.1 . Both Mac ZIP and Windows installer passed anonymous public download with SHA-256 matching the local artifacts; SHA256SUMS.txt is included. This is a prerelease, and Windows runtime/license activation remain unverified until the owner tests.
 - The real free checkout was opened with the one-use discount applied and visibly showed US$0. No checkout was submitted and no license key was issued by the agent. Paid-sales setup still requires the owner to connect a payout account and submit Polar account review.
+
+## 0.2.0 candidate (2026-11-09)
+
+- Adds API-mode streaming, an in-memory repeat cache (48 entries, never written to disk), provider connection warm-up, tone setting, provider presets, in-memory key and license caching, a Settings dark mode, and the fixes listed in CHANGELOG.md. Merged to main as PR #1 and PR #2 (PR #2 pending at time of writing).
+- Verified on a Linux scratch copy with two platform stubs: the full crate compiles and 36 Rust tests pass. Settings pages were rendered in light and dark with a mocked backend. A Tauri shell on the Mac was not available, so nothing in 0.2.0 has run natively.
+- Not yet verified on macOS: streaming against a real provider, popup rendering of streamed text, Keychain behavior with the new caches, and the EUR price against a live Polar checkout.
+- Polar product is still US$10. The app now labels the offline model as €10 from `priceLabel`. Add a EUR price in Polar before paid sales, or set `priceLabel` back to the real charged price.
+- Signing and notarization of 0.2.0 are still to be done locally with the Developer ID. Windows remains unsigned.

@@ -49,7 +49,21 @@ pub fn validate_identity(v: &Value, r: &Release) -> Result<(), String> {
     }
     Ok(())
 }
+// Only a successful read is remembered, so one failed Keychain read can never
+// lock a paying customer out. Cleared when the license is saved or removed.
+static LICENSE_CACHE: std::sync::Mutex<Option<Entitlement>> = std::sync::Mutex::new(None);
+fn forget_cached_license() {
+    *LICENSE_CACHE.lock().unwrap() = None;
+}
 pub fn cached() -> Option<Entitlement> {
+    if let Some(record) = LICENSE_CACHE.lock().unwrap().as_ref() {
+        return Some(record.clone());
+    }
+    let record = load_cached()?;
+    *LICENSE_CACHE.lock().unwrap() = Some(record.clone());
+    Some(record)
+}
+fn load_cached() -> Option<Entitlement> {
     let entry = crate::secret("license-v1").ok()?;
     let record: Entitlement = serde_json::from_str(&entry.get_password().ok()?).ok()?;
     let config = release();
@@ -72,6 +86,7 @@ pub fn save(key: &str) -> Result<(), String> {
             .unwrap_or_default()
             .as_secs(),
     };
+    forget_cached_license();
     crate::secret("license-v1")?
         .set_password(&serde_json::to_string(&record).unwrap())
         .map_err(|_| "Couldn't securely save the verified license.".into())
@@ -83,6 +98,7 @@ pub async fn refresh(client: &reqwest::Client) {
                 let _ = save(&record.key);
             }
             Err(error) if error.revoked => {
+                forget_cached_license();
                 if let Ok(entry) = crate::secret("license-v1") {
                     let _ = entry.delete_credential();
                 }
@@ -118,7 +134,9 @@ async fn validate_at(
                 "Polar could not validate this license (HTTP {}).",
                 status.as_u16()
             ),
-            revoked: matches!(status.as_u16(), 400 | 403 | 404),
+            // A 400 means our own request was wrong, not that the license is bad,
+            // so it must never wipe a paid license that was already verified.
+            revoked: matches!(status.as_u16(), 403 | 404),
         });
     }
     let body: Value = response.json().await.map_err(|_| ValidationError {
@@ -174,5 +192,23 @@ mod tests {
         assert!(request.to_lowercase().contains("polar-version: 2026-10"));
         assert!(request.contains("\"benefit_id\":\"benefit\""));
         assert!(!request.to_lowercase().contains("authorization:"));
+    }
+    #[test]
+    fn only_forbidden_or_missing_revokes_a_saved_license() {
+        let r = Release {
+            polar_organization_id: "org".into(),
+            polar_benefit_id: "benefit".into(),
+            checkout_url: "".into(),
+            price_label: "".into(),
+            model: None,
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (code, revoked) in [(400u16, false), (429, false), (500, false), (403, true), (404, true)] {
+            let (url, _rx) = crate::test_http::server(code, "{}");
+            let error = runtime
+                .block_on(validate_at(&reqwest::Client::new(), "test-only-license", &r, &url))
+                .unwrap_err();
+            assert_eq!(error.revoked, revoked, "status {code}");
+        }
     }
 }
