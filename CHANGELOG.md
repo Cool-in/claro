@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Skips selections with nothing to translate (numbers, symbols, a lone link or email address) and longer passages already in the target language, so they never cost a provider request.
+- Works with models that reject `max_tokens` or a custom `temperature`: a 400 is retried once in the newer request shape and remembered for that provider and model.
+- Provider errors now include the provider's own short message, and a missing model or URL gets a clear hint.
+- Remembered translations appear at once, with no debounce or loading state.
+- Re-opens the provider connection when you start interacting after an idle spell.
+- The selection reader restarts itself if it stops, and reports clearly if it keeps failing.
+- The tray menu says Pause Claro or Resume Claro to match the current state.
+- Manual translation gains a Copy button and Cmd or Ctrl + Enter.
+- The popup no longer asks the native side to resize on every streamed token.
+
 ## 0.2.0
 
 Faster API mode, more control, and fixes found in an audit.

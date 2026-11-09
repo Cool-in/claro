@@ -43,6 +43,7 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
   let target = 'Spanish';
   let current: Translation = { state: 'loading' };
   let menuOpen = false;
+  let lastSize = '';
   const canvas = document.createElement('canvas');
   const measure = canvas.getContext('2d')!;
 
@@ -56,6 +57,11 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
     // Measure intrinsic content, never a flex item stretched by an old window size.
     panel.style.height = 'auto';
     const height = Math.ceil(panel.getBoundingClientRect().height);
+    // Streaming re-renders many times a second; only cross to the native side
+    // when the panel actually changes size.
+    const next = `${width}x${height}`;
+    if (next === lastSize) return;
+    lastSize = next;
     invoke('resize_popup', { width: width + 12, height: height + 12 }).catch(() => {});
   }
   function setTarget(language: string) {
@@ -76,7 +82,7 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
   }
   function render(payload: Translation) {
     current = payload;
-    if (payload.state === 'empty') { text.textContent = ''; setMenu(false); return; }
+    if (payload.state === 'empty') { text.textContent = ''; lastSize = ''; setMenu(false); return; }
     setTarget(payload.target || target);
     copyButton.disabled = payload.state !== 'ready';
     status.textContent = payload.state === 'loading' ? 'Translating…' : payload.state === 'error' ? 'Try again' : '';
@@ -86,7 +92,7 @@ export function mountPopup(root: HTMLElement, mark: string, close: string) {
     else text.textContent = payload.text || payload.error || '';
     requestAnimationFrame(() => {
       size();
-      invoke('popup_rendered', { state: payload.state, generation: payload.generation }).catch(() => {});
+      if (payload.state !== 'streaming') invoke('popup_rendered', { state: payload.state, generation: payload.generation }).catch(() => {});
     });
   }
   let activePointer:number|null=null;
