@@ -83,3 +83,4 @@ html:not(.popup-root) .status-dot.paused{background:#8a8775}
 
 .sidebar-bottom .text-button,.sidebar-bottom button{font-size:10px}
 .badge{margin-bottom:6px}
+.manual-copy[hidden]{display:none}

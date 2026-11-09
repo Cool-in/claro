@@ -19,6 +19,7 @@ Claro is open source under the MIT licence. Build it yourself and use your own O
 - Explicit resumable model download, pinned SHA-256 and byte-size checks, disk-space checks and atomic installation. No automatic cloud fallback.
 - Polar's public customer license validation API, expected organization/benefit checks and a secure cached entitlement. Network failure preserves a previously verified lifetime license; a definitive invalid/revoked response removes it. No organization token is bundled.
 - Cloud speed: tokens stream into the popup as they arrive, the provider connection is opened ahead of the first selection, and the last 48 translations are remembered in memory only (hashed keys, never written to disk, gone on quit) so re-selecting text is instant.
+- Cloud thrift and resilience: selections with nothing to translate (numbers, symbols, a lone link or email address) and longer passages already in the target language are skipped without a provider request. A provider that rejects `max_tokens` or `temperature` is retried once in the newer request shape, and provider error text is shown in the popup. The selection reader restarts itself if it stops.
 - Cloud options: a Neutral, Formal or Casual tone, and one-click provider presets (OpenAI, Groq, OpenRouter, Ollama). Preset model names are suggestions you can edit.
 - Launch at login is optional and off by default.
 
@@ -33,7 +34,7 @@ npm test
 npm run tauri -- dev
 ```
 
-On this Mac, reuse `/Users/colin/Library/Developer/BuildCaches/Claro/macos/debug/Claro` as `CARGO_TARGET_DIR`. Check disk headroom before builds. `npm test` uses that stable location automatically on macOS unless the environment overrides it. Keep serial Rust tests.
+On a Mac, a stable `CARGO_TARGET_DIR` such as `~/Library/Developer/BuildCaches/Claro/macos/debug/Claro` keeps rebuilds quick. Check disk headroom before builds. `npm test` uses that stable location automatically on macOS unless the environment overrides it. Keep serial Rust tests.
 
 Build a bundle with the offline worker embedded:
 

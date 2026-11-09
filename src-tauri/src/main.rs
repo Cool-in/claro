@@ -38,6 +38,7 @@ struct Core {
     client: reqwest::Client,
     tracker: Mutex<selection::SelectionTracker>,
     paused: AtomicBool,
+    quitting: AtomicBool,
     permission: AtomicBool,
     child: Mutex<Option<std::process::Child>>,
     popup_ready: AtomicBool,
@@ -573,6 +574,7 @@ fn remove_key(core: State<Arc<Core>>) -> Result<(), String> {
 #[tauri::command]
 fn set_paused(app: tauri::AppHandle, core: State<Arc<Core>>, paused: bool) {
     core.paused.store(paused, Ordering::SeqCst);
+    sync_pause_label(&app, paused);
     core.tracker.lock().unwrap().clear();
     control(&core);
     dismiss(&app, &core, false);
@@ -772,180 +774,264 @@ fn capture(app: tauri::AppHandle, core: Arc<Core>) {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
         }
-        let mut command = std::process::Command::new(&path);
-        command
-            .arg(std::process::id().to_string())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = app.emit("capture-error", "Couldn't start native selection reader.");
-                return;
+        let mut quick_exits = 0u32;
+        loop {
+            let started = std::time::Instant::now();
+            let mut command = std::process::Command::new(&path);
+            command
+                .arg(std::process::id().to_string())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
             }
-        };
-        let stdout = child.stdout.take().unwrap();
-        *core.child.lock().unwrap() = Some(child);
-        control(&core);
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str::<Capture>(&line) else {
-                continue;
+            let mut child = match command.spawn() {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = app.emit("capture-error", "Couldn't start native selection reader.");
+                    return;
+                }
             };
-            if event.kind == "selection" {
-                qa(&app, &core, "selection_seen");
-            }
-            if event.kind == "status" {
-                core.permission.store(event.trusted, Ordering::SeqCst);
-                if !event.trusted {
-                    core.tracker.lock().unwrap().clear();
-                    dismiss(&app, &core, false);
+            let stdout = child.stdout.take().unwrap();
+            *core.child.lock().unwrap() = Some(child);
+            control(&core);
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Ok(event) = serde_json::from_str::<Capture>(&line) else {
+                    continue;
+                };
+                if event.kind == "selection" {
+                    qa(&app, &core, "selection_seen");
                 }
-                let _ = app.emit("state-changed", ());
-                continue;
-            }
-            if event.kind == "pointer-down" {
-                let mut bounds = None;
-                let inside = app
-                    .get_webview_window("popup")
-                    .map(|window| {
-                        if !window.is_visible().unwrap_or(false) {
-                            return false;
-                        }
-                        let Ok(position) = window.outer_position() else {
-                            return false;
-                        };
-                        let Ok(size) = window.outer_size() else {
-                            return false;
-                        };
-                        #[cfg(target_os = "macos")]
-                        let scale = window.scale_factor().unwrap_or(1.0);
-                        #[cfg(not(target_os = "macos"))]
-                        let scale = 1.0;
-                        bounds = Some((
-                            position.x as f64 / scale,
-                            position.y as f64 / scale,
-                            size.width as f64 / scale,
-                            size.height as f64 / scale,
-                            scale,
-                        ));
-                        point_in_window(
-                            event.x,
-                            event.y,
-                            position.x as f64 / scale,
-                            position.y as f64 / scale,
-                            size.width as f64 / scale,
-                            size.height as f64 / scale,
-                        )
-                    })
-                    .unwrap_or(false);
-                #[cfg(debug_assertions)]
-                {
-                    core.diagnostics.lock().unwrap()["last_pointer"] = json!({"point":[event.x,event.y],"popup_bounds_and_scale":bounds,"inside":inside});
-                }
-                qa(
-                    &app,
-                    &core,
-                    if inside {
-                        "pointer_inside"
-                    } else {
-                        "pointer_outside"
-                    },
-                );
-                if !inside {
-                    dismiss(&app, &core, true);
-                }
-                continue;
-            }
-            if event.kind == "pointer-up" {
-                if core.popup_dragging.load(Ordering::SeqCst) {
-                    let app = app.clone();
-                    let core = core.clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        if core.popup_dragging.load(Ordering::SeqCst) {
-                            finish_drag(&app, &core);
-                        }
-                    });
-                }
-                continue;
-            }
-            if event.kind == "dismiss" {
-                dismiss(&app, &core, true);
-                continue;
-            }
-            if event.kind == "clear" {
-                if event.reason == "self" && core.pending_popup.lock().unwrap().is_some() {
+                if event.kind == "status" {
+                    core.permission.store(event.trusted, Ordering::SeqCst);
+                    if !event.trusted {
+                        core.tracker.lock().unwrap().clear();
+                        dismiss(&app, &core, false);
+                    }
+                    let _ = app.emit("state-changed", ());
                     continue;
                 }
-                core.tracker.lock().unwrap().clear();
-
-                dismiss(&app, &core, false);
-                continue;
-            }
-            let settings = core.settings.lock().unwrap().clone();
-            if core.paused.load(Ordering::SeqCst)
-                || !settings.consent
-                || settings
-                    .excluded_apps
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&event.app))
-            {
-                dismiss(&app, &core, false);
-                continue;
-            }
-            let generation = {
-                let mut tracker = core.tracker.lock().unwrap();
-                tracker.select(&event.app, &event.text).or_else(|| {
-                    if event.settled {
-                        tracker.settle(&event.app, &event.text)
-                    } else {
-                        None
+                if event.kind == "pointer-down" {
+                    rewarm_if_idle(&core);
+                    let mut bounds = None;
+                    let inside = app
+                        .get_webview_window("popup")
+                        .map(|window| {
+                            if !window.is_visible().unwrap_or(false) {
+                                return false;
+                            }
+                            let Ok(position) = window.outer_position() else {
+                                return false;
+                            };
+                            let Ok(size) = window.outer_size() else {
+                                return false;
+                            };
+                            #[cfg(target_os = "macos")]
+                            let scale = window.scale_factor().unwrap_or(1.0);
+                            #[cfg(not(target_os = "macos"))]
+                            let scale = 1.0;
+                            bounds = Some((
+                                position.x as f64 / scale,
+                                position.y as f64 / scale,
+                                size.width as f64 / scale,
+                                size.height as f64 / scale,
+                                scale,
+                            ));
+                            point_in_window(
+                                event.x,
+                                event.y,
+                                position.x as f64 / scale,
+                                position.y as f64 / scale,
+                                size.width as f64 / scale,
+                                size.height as f64 / scale,
+                            )
+                        })
+                        .unwrap_or(false);
+                    #[cfg(debug_assertions)]
+                    {
+                        core.diagnostics.lock().unwrap()["last_pointer"] = json!({"point":[event.x,event.y],"popup_bounds_and_scale":bounds,"inside":inside});
                     }
-                })
-            };
-            let Some(generation) = generation else {
-                continue;
-            };
-            qa(&app, &core, "selection_accepted");
-            core.tracker
-                .lock()
-                .unwrap()
-                .set_anchor(generation, event.x, event.y);
-            core.tracker.lock().unwrap().set_top(generation, event.top);
-            let delay = if event.settled { 30 } else { 150 };
-            let selection = selection::ActiveSelection {
-                app: event.app,
-                text: event.text,
-                x: event.x,
-                y: event.y,
-                top: event.top,
-            };
-            spawn_translation(
-                app.clone(),
-                core.clone(),
-                settings,
-                selection,
-                generation,
-                delay,
-            );
-        }
-        if let Some(mut child) = core.child.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
+                    qa(
+                        &app,
+                        &core,
+                        if inside {
+                            "pointer_inside"
+                        } else {
+                            "pointer_outside"
+                        },
+                    );
+                    if !inside {
+                        dismiss(&app, &core, true);
+                    }
+                    continue;
+                }
+                if event.kind == "pointer-up" {
+                    if core.popup_dragging.load(Ordering::SeqCst) {
+                        let app = app.clone();
+                        let core = core.clone();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            if core.popup_dragging.load(Ordering::SeqCst) {
+                                finish_drag(&app, &core);
+                            }
+                        });
+                    }
+                    continue;
+                }
+                if event.kind == "dismiss" {
+                    dismiss(&app, &core, true);
+                    continue;
+                }
+                if event.kind == "clear" {
+                    if event.reason == "self" && core.pending_popup.lock().unwrap().is_some() {
+                        continue;
+                    }
+                    core.tracker.lock().unwrap().clear();
+
+                    dismiss(&app, &core, false);
+                    continue;
+                }
+                let settings = core.settings.lock().unwrap().clone();
+                if core.paused.load(Ordering::SeqCst)
+                    || !settings.consent
+                    || settings
+                        .excluded_apps
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&event.app))
+                {
+                    dismiss(&app, &core, false);
+                    continue;
+                }
+                if !worth_translating(&event.text)
+                    || (settings.source_language == "Auto"
+                        && offline::already_in(&event.text, &settings.target))
+                {
+                    core.tracker.lock().unwrap().clear();
+                    dismiss(&app, &core, false);
+                    continue;
+                }
+                let generation = {
+                    let mut tracker = core.tracker.lock().unwrap();
+                    tracker.select(&event.app, &event.text).or_else(|| {
+                        if event.settled {
+                            tracker.settle(&event.app, &event.text)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let Some(generation) = generation else {
+                    continue;
+                };
+                qa(&app, &core, "selection_accepted");
+                core.tracker
+                    .lock()
+                    .unwrap()
+                    .set_anchor(generation, event.x, event.y);
+                core.tracker.lock().unwrap().set_top(generation, event.top);
+                let delay = if event.settled { 30 } else { 150 };
+                let selection = selection::ActiveSelection {
+                    app: event.app,
+                    text: event.text,
+                    x: event.x,
+                    y: event.y,
+                    top: event.top,
+                };
+                spawn_translation(
+                    app.clone(),
+                    core.clone(),
+                    settings,
+                    selection,
+                    generation,
+                    delay,
+                );
+            }
+            if let Some(mut child) = core.child.lock().unwrap().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // The reader stopped. Unless Claro is quitting, start it again so
+            // select-to-translate keeps working, giving up after repeated quick exits.
+            if core.quitting.load(Ordering::SeqCst) {
+                return;
+            }
+            quick_exits = next_quick_exits(quick_exits, started.elapsed());
+            if quick_exits > 5 {
+                let error = "The selection reader keeps stopping. Quit and reopen Claro.";
+                *core.status_error.lock().unwrap() = Some(error.into());
+                let _ = app.emit("capture-error", error);
+                let _ = app.emit("state-changed", ());
+                return;
+            }
+            core.tracker.lock().unwrap().clear();
+            dismiss(&app, &core, false);
+            std::thread::sleep(Duration::from_secs(1 + quick_exits as u64));
         }
     });
+}
+/// Counts consecutive reader runs that ended within ten seconds of starting.
+fn next_quick_exits(previous: u32, ran_for: Duration) -> u32 {
+    if ran_for < Duration::from_secs(10) {
+        previous + 1
+    } else {
+        0
+    }
+}
+/// Selections with nothing to translate (numbers, symbols, a lone link or email
+/// address) are ignored so they never cost a provider request.
+fn worth_translating(text: &str) -> bool {
+    let text = text.trim();
+    if text.chars().filter(|c| c.is_alphabetic()).count() < 2 {
+        return false;
+    }
+    if !text.contains(char::is_whitespace) {
+        let lower = text.to_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
+            return false;
+        }
+        if let Some((name, host)) = text.split_once('@') {
+            if !name.is_empty() && host.contains('.') {
+                return false;
+            }
+        }
+    }
+    true
+}
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+static LAST_WARM: AtomicU64 = AtomicU64::new(0);
+fn warm_is_stale(last: u64, now: u64) -> bool {
+    now.saturating_sub(last) >= 240
+}
+/// Idle connections are dropped after a few minutes. Re-open one as soon as the
+/// user starts interacting, so the next translation skips the TLS handshake.
+fn rewarm_if_idle(core: &Arc<Core>) {
+    if core.paused.load(Ordering::SeqCst) {
+        return;
+    }
+    if warm_is_stale(LAST_WARM.load(Ordering::SeqCst), now_secs()) {
+        warm_provider(core);
+    }
+}
+struct PauseItem(MenuItem<tauri::Wry>);
+fn sync_pause_label(app: &tauri::AppHandle, paused: bool) {
+    if let Some(item) = app.try_state::<PauseItem>() {
+        let _ = item.0.set_text(if paused { "Resume Claro" } else { "Pause Claro" });
+    }
 }
 fn warm_provider(core: &Arc<Core>) {
     let s = core.settings.lock().unwrap().clone();
     if s.mode != "cloud" || !s.consent || key_for(&s).is_err() {
         return;
     }
+    LAST_WARM.store(now_secs(), Ordering::SeqCst);
     let client = core.client.clone();
     tauri::async_runtime::spawn(async move {
         provider::warm(&client, &s).await;
@@ -963,7 +1049,15 @@ fn spawn_translation(
     let is_cloud = settings.mode == "cloud";
     let owner = core.clone();
     let task = tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        // A remembered translation appears at once: no debounce, no loading state.
+        let remembered = if is_cloud {
+            core.cache.get(&settings, &selection.text)
+        } else {
+            None
+        };
+        if remembered.is_none() {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         if !core.tracker.lock().unwrap().is_current(generation) {
             return;
         }
@@ -971,19 +1065,21 @@ fn spawn_translation(
         if !show_popup(&app, &core, selection.x, selection.y, selection.top) {
             return;
         }
-        if !emit_current(
-            &app,
-            &core,
-            generation,
-            json!({"state":"loading","target":settings.target,"mode":settings.mode}),
-        ) {
+        if remembered.is_none()
+            && !emit_current(
+                &app,
+                &core,
+                generation,
+                json!({"state":"loading","target":settings.target,"mode":settings.mode}),
+            )
+        {
             return;
         }
         qa(&app, &core, "translation_started");
         let result = if settings.mode == "offline" {
             offline::translate_auto(&app, &settings, &selection.text, core.clone(), generation)
                 .await
-        } else if let Some(hit) = core.cache.get(&settings, &selection.text) {
+        } else if let Some(hit) = remembered {
             Ok(hit)
         } else {
             match key_for(&settings) {
@@ -1322,6 +1418,7 @@ fn main() {
             .unwrap(),
         tracker: Mutex::new(selection::SelectionTracker::default()),
         paused: AtomicBool::new(false),
+        quitting: AtomicBool::new(false),
         permission: AtomicBool::new(!cfg!(target_os = "macos")),
         child: Mutex::new(None),
         popup_ready: AtomicBool::new(false),
@@ -1365,7 +1462,8 @@ fn main() {
             if let Ok(bytes)=std::fs::read(placement_path(app.handle())){if let Ok(position)=serde_json::from_slice::<(i32,i32)>(&bytes){*core.popup_saved_position.lock().unwrap()=Some(position);}}
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            let pause = MenuItem::with_id(app, "pause", "Pause / resume", true, None::<&str>)?;
+            let pause = MenuItem::with_id(app, "pause", "Pause Claro", true, None::<&str>)?;
+            app.manage(PauseItem(pause.clone()));
             let settings_item =
                 MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
             let manual =
@@ -1393,6 +1491,7 @@ fn main() {
                     let core = app.state::<Arc<Core>>();
                     match event.id.as_ref() {
                         "quit" => {
+                            core.quitting.store(true, Ordering::SeqCst);
                             if let Some(mut c) = core.child.lock().unwrap().take() {
                                 let _ = c.kill();
                                 let _ = c.wait();
@@ -1409,6 +1508,7 @@ fn main() {
                         "pause" => {
                             let next = !core.paused.load(Ordering::SeqCst);
                             core.paused.store(next, Ordering::SeqCst);
+                            sync_pause_label(app, next);
                             core.tracker.lock().unwrap().clear();
                             control(&core);
                             dismiss(app, &core, false);
@@ -1584,5 +1684,32 @@ mod pointer_bounds_tests {
         assert!(!point_in_window(288., 220., 100., 200., 188., 85.));
         assert!(!point_in_window(120., 285., 100., 200., 188., 85.));
         assert!(point_in_window(-300., 30., -400., 20., 188., 85.));
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn selections_with_nothing_to_translate_are_skipped() {
+        for text in ["", "  ", "12,345.67", "→ ✓", "a", "https://example.com/a?b=c", "www.example.com", "someone@example.com"] {
+            assert!(!worth_translating(text), "{text}");
+        }
+        for text in ["Hello", "Guten Tag", "See https://example.com for details", "今日は", "email me @ noon"] {
+            assert!(worth_translating(text), "{text}");
+        }
+    }
+    #[test]
+    fn connection_is_rewarmed_only_after_idling() {
+        assert!(warm_is_stale(0, 1000));
+        assert!(!warm_is_stale(1000, 1100));
+        assert!(warm_is_stale(1000, 1240));
+        assert!(!warm_is_stale(2000, 1000));
+    }
+    #[test]
+    fn only_consecutive_quick_exits_count_toward_giving_up() {
+        assert_eq!(next_quick_exits(0, Duration::from_secs(1)), 1);
+        assert_eq!(next_quick_exits(4, Duration::from_secs(2)), 5);
+        assert_eq!(next_quick_exits(4, Duration::from_secs(60)), 0);
     }
 }

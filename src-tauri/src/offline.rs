@@ -388,6 +388,17 @@ fn detected_code(text: &str) -> Result<&'static str, String> {
     };
     Ok(code)
 }
+/// True only when the text is confidently already in the target language, so
+/// automatic translation can skip it without calling a provider or the model.
+pub fn already_in(text: &str, target: &str) -> bool {
+    let Some(info) = whatlang::detect(text) else {
+        return false;
+    };
+    if !info.is_reliable() {
+        return false;
+    }
+    matches!((detected_code(text), language_code(target)), (Ok(a), Some(b)) if a == b)
+}
 #[cfg(offline_engine)]
 fn engine(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     let root = app
@@ -854,5 +865,21 @@ mod download_integration_tests {
                 file.bytes
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod already_in_tests {
+    use super::*;
+    #[test]
+    fn only_confident_matches_are_skipped() {
+        let spanish = "Buenos días. Me gustaría reservar una mesa para cuatro personas esta noche, cerca de la ventana si es posible. También queremos saber si tienen opciones vegetarianas en el menú y a qué hora cierra la cocina los domingos.";
+        let english = "Good morning. I would like to book a table for four people tonight, near the window if possible. We would also like to know whether you have vegetarian options on the menu and what time the kitchen closes on Sundays.";
+        assert!(already_in(spanish, "Spanish"));
+        assert!(!already_in(english, "Spanish"));
+        assert!(already_in(english, "English"));
+        assert!(!already_in("Buenos días", "Spanish"));
+        assert!(!already_in("ok", "English"));
+        assert!(!already_in(spanish, "Klingon"));
     }
 }

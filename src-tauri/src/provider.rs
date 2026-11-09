@@ -91,12 +91,86 @@ fn request_body(s: &Settings, text: &str, stream: bool) -> serde_json::Value {
     }
     body
 }
-fn http_error(code: u16) -> String {
-    match code {
-        401 | 403 => "Your provider rejected the API key. Check it in Settings.".into(),
-        429 => "Your provider's rate or credit limit was reached. Try again later.".into(),
-        _ => format!("Your provider returned HTTP {}. Try again later.", code),
+/// A short, single-line version of the provider's own error text, when it sent one.
+fn provider_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = value["error"]["message"]
+        .as_str()
+        .or(value["error"].as_str())
+        .or(value["message"].as_str())?;
+    let line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
     }
+    if line.chars().count() > 160 {
+        return Some(format!("{}…", line.chars().take(160).collect::<String>()));
+    }
+    Some(line)
+}
+fn http_error(code: u16, body: &str) -> String {
+    let base = match code {
+        401 | 403 => return "Your provider rejected the API key. Check it in Settings.".into(),
+        429 => return "Your provider's rate or credit limit was reached. Try again later.".into(),
+        404 => "Your provider couldn't find that model or URL. Check them in Settings.".to_string(),
+        400 => "Your provider rejected the request. Check the model name in Settings.".to_string(),
+        _ => format!("Your provider returned HTTP {}. Try again later.", code),
+    };
+    match provider_detail(body) {
+        Some(detail) => format!("{} ({})", base, detail),
+        None => base,
+    }
+}
+// Newer reasoning models reject `max_tokens` and a custom `temperature`. When a
+// provider answers 400, the request is retried once in this compatible shape and
+// the provider and model are remembered so later requests skip the failed try.
+static COMPAT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+fn compat_id(s: &Settings) -> String {
+    format!("{}\n{}", s.base_url.trim_end_matches('/'), s.model)
+}
+fn compat(mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = body.as_object_mut() {
+        map.remove("temperature");
+        map.remove("max_tokens");
+        map.insert("max_completion_tokens".into(), json!(8192));
+    }
+    body
+}
+const UNREACHABLE: &str = "Couldn't reach your provider. Check your connection and provider URL.";
+async fn send(
+    client: &reqwest::Client,
+    s: &Settings,
+    key: &str,
+    text: &str,
+    stream: bool,
+) -> Result<reqwest::Response, String> {
+    let url = endpoint(&s.base_url)?;
+    let known = COMPAT.lock().unwrap().as_deref() == Some(compat_id(s).as_str());
+    let mut body = request_body(s, text, stream);
+    if known {
+        body = compat(body);
+    }
+    let response = client
+        .post(&url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| UNREACHABLE)?;
+    let code = response.status().as_u16();
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let detail = response.text().await.unwrap_or_default();
+    if code == 400 && !known {
+        let retry = client.post(&url).bearer_auth(key).json(&compat(body)).send().await;
+        if let Ok(retry) = retry {
+            if retry.status().is_success() {
+                *COMPAT.lock().unwrap() = Some(compat_id(s));
+                return Ok(retry);
+            }
+        }
+    }
+    Err(http_error(code, &detail))
 }
 const TOO_LONG: &str =
     "This selection is too long for your provider response limit. Try a shorter passage.";
@@ -117,17 +191,7 @@ pub async fn translate(
     text: &str,
 ) -> Result<String, String> {
     check_input(s, text)?;
-    let response = client
-        .post(endpoint(&s.base_url)?)
-        .bearer_auth(key)
-        .json(&request_body(s, text, false))
-        .send()
-        .await
-        .map_err(|_| "Couldn't reach your provider. Check your connection and provider URL.")?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(http_error(status.as_u16()));
-    }
+    let response = send(client, s, key, text, false).await?;
     let body: serde_json::Value = response
         .json()
         .await
@@ -156,17 +220,7 @@ pub async fn translate_stream(
 ) -> Result<String, String> {
     use futures_util::StreamExt;
     check_input(s, text)?;
-    let response = client
-        .post(endpoint(&s.base_url)?)
-        .bearer_auth(key)
-        .json(&request_body(s, text, true))
-        .send()
-        .await
-        .map_err(|_| "Couldn't reach your provider. Check your connection and provider URL.")?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(http_error(status.as_u16()));
-    }
+    let response = send(client, s, key, text, true).await?;
     let is_stream = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -431,5 +485,45 @@ mod length_tests {
         assert!(check_input(&s, &"\u{3042}".repeat(5000)).is_ok());
         assert!(check_input(&s, &"\u{3042}".repeat(12000)).is_ok());
         assert!(check_input(&s, &"\u{3042}".repeat(12001)).unwrap_err().contains("12,000 characters"));
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+    #[test]
+    fn compatible_body_drops_rejected_parameters() {
+        let s = Settings::default();
+        let body = compat(request_body(&s, "Hi", true));
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 8192);
+        assert_eq!(body["stream"], true);
+    }
+    #[test]
+    fn provider_error_text_is_short_and_single_line() {
+        let body = r#"{"error":{"message":"Unsupported parameter:\n 'max_tokens'"}}"#;
+        assert_eq!(provider_detail(body).unwrap(), "Unsupported parameter: 'max_tokens'");
+        assert!(provider_detail("not json").is_none());
+        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(400));
+        assert_eq!(provider_detail(&long).unwrap().chars().count(), 161);
+        assert!(http_error(404, body).contains("couldn't find that model"));
+        assert!(http_error(404, body).contains("max_tokens"));
+        assert!(!http_error(401, body).contains("max_tokens"));
+    }
+    #[test]
+    fn a_400_is_retried_once_in_the_compatible_shape() {
+        let (url, rx) = crate::test_http::server(400, r#"{"error":{"message":"bad model"}}"#);
+        let mut s = Settings::default();
+        s.consent = true;
+        s.base_url = url;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(translate(&reqwest::Client::new(), &s, "test-only-key", "Hi"))
+            .unwrap_err();
+        assert!(error.contains("bad model"), "{error}");
+        let first = rx.recv().unwrap();
+        assert!(first.contains("max_tokens"));
+        assert!(!first.contains("max_completion_tokens"));
     }
 }
